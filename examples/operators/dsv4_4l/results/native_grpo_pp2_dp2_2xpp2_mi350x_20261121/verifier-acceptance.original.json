@@ -1,0 +1,156 @@
+{
+  "status": "PASS",
+  "scope": "Single-node eight-GPU four-layer native verl GRPO, actor PP2/DP2 and two PP2 rollout replicas.",
+  "dp_gradient_reduction": true,
+  "full_quantized_base_training": false,
+  "replicas": [
+    {
+      "status": "PASS",
+      "placement": null,
+      "scope": "Single-node four-GPU, four-layer actor PP2/DP2, rollout replica 0 PP2/DP1; three continuous native verl GRPO/PPO updates.",
+      "versions": [
+        {
+          "version": 0,
+          "global_step": 0,
+          "actual_updates": 0,
+          "expected_tokens": 1188,
+          "compared_tokens": 1188,
+          "mismatch_count": 0,
+          "mean_abs_diff": 0.0,
+          "max_abs_diff": 0.0,
+          "batch_invariance": true,
+          "sync": true,
+          "pids": {
+            "0": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8760:1980e50fa0634d2d8cdf1d4fde33a99e",
+            "1": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8761:bda1e2f3115d41248721c74aa26ce803"
+          }
+        },
+        {
+          "version": 1,
+          "global_step": 1,
+          "actual_updates": 1,
+          "expected_tokens": 1188,
+          "compared_tokens": 1188,
+          "mismatch_count": 0,
+          "mean_abs_diff": 0.0,
+          "max_abs_diff": 0.0,
+          "batch_invariance": true,
+          "sync": true,
+          "pids": {
+            "0": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8760:1980e50fa0634d2d8cdf1d4fde33a99e",
+            "1": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8761:bda1e2f3115d41248721c74aa26ce803"
+          }
+        },
+        {
+          "version": 2,
+          "global_step": 2,
+          "actual_updates": 2,
+          "expected_tokens": 1188,
+          "compared_tokens": 1188,
+          "mismatch_count": 0,
+          "mean_abs_diff": 0.0,
+          "max_abs_diff": 0.0,
+          "batch_invariance": true,
+          "sync": true,
+          "pids": {
+            "0": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8760:1980e50fa0634d2d8cdf1d4fde33a99e",
+            "1": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8761:bda1e2f3115d41248721c74aa26ce803"
+          }
+        },
+        {
+          "version": 3,
+          "global_step": 3,
+          "actual_updates": 3,
+          "expected_tokens": 1188,
+          "compared_tokens": 1188,
+          "mismatch_count": 0,
+          "mean_abs_diff": 0.0,
+          "max_abs_diff": 0.0,
+          "batch_invariance": true,
+          "sync": true,
+          "pids": {
+            "0": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8760:1980e50fa0634d2d8cdf1d4fde33a99e",
+            "1": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8761:bda1e2f3115d41248721c74aa26ce803"
+          }
+        }
+      ],
+      "dp_gradient_reduction": true,
+      "full_quantized_base_training": false,
+      "additional_v3_stress": null
+    },
+    {
+      "status": "PASS",
+      "placement": null,
+      "scope": "Single-node four-GPU, four-layer actor PP2/DP2, rollout replica 1 PP2/DP1; three continuous native verl GRPO/PPO updates.",
+      "versions": [
+        {
+          "version": 0,
+          "global_step": 0,
+          "actual_updates": 0,
+          "expected_tokens": 1188,
+          "compared_tokens": 1188,
+          "mismatch_count": 0,
+          "mean_abs_diff": 0.0,
+          "max_abs_diff": 0.0,
+          "batch_invariance": true,
+          "sync": true,
+          "pids": {
+            "0": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8754:2afb13cff88e460e927c2bdee364fd77",
+            "1": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8755:ceef4d5530e645f486a331cce05af74a"
+          }
+        },
+        {
+          "version": 1,
+          "global_step": 1,
+          "actual_updates": 1,
+          "expected_tokens": 1188,
+          "compared_tokens": 1188,
+          "mismatch_count": 0,
+          "mean_abs_diff": 0.0,
+          "max_abs_diff": 0.0,
+          "batch_invariance": true,
+          "sync": true,
+          "pids": {
+            "0": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8754:2afb13cff88e460e927c2bdee364fd77",
+            "1": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8755:ceef4d5530e645f486a331cce05af74a"
+          }
+        },
+        {
+          "version": 2,
+          "global_step": 2,
+          "actual_updates": 2,
+          "expected_tokens": 1188,
+          "compared_tokens": 1188,
+          "mismatch_count": 0,
+          "mean_abs_diff": 0.0,
+          "max_abs_diff": 0.0,
+          "batch_invariance": true,
+          "sync": true,
+          "pids": {
+            "0": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8754:2afb13cff88e460e927c2bdee364fd77",
+            "1": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8755:ceef4d5530e645f486a331cce05af74a"
+          }
+        },
+        {
+          "version": 3,
+          "global_step": 3,
+          "actual_updates": 3,
+          "expected_tokens": 1188,
+          "compared_tokens": 1188,
+          "mismatch_count": 0,
+          "mean_abs_diff": 0.0,
+          "max_abs_diff": 0.0,
+          "batch_invariance": true,
+          "sync": true,
+          "pids": {
+            "0": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8754:2afb13cff88e460e927c2bdee364fd77",
+            "1": "e718f068b7f5501c588a4ed503360b97cd21927d8a6a9fdd67ee32bf:8755:ceef4d5530e645f486a331cce05af74a"
+          }
+        }
+      ],
+      "dp_gradient_reduction": true,
+      "full_quantized_base_training": false,
+      "additional_v3_stress": null
+    }
+  ]
+}

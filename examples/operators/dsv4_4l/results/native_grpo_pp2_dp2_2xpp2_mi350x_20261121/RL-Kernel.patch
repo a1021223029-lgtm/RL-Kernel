@@ -1,0 +1,684 @@
+diff --git a/examples/operators/dsv4_4l/distributed_evidence.py b/examples/operators/dsv4_4l/distributed_evidence.py
+index 633b73fc019d825cb852b07b13c492d133762f04..bc08d11ff3aa469502e05dcd7e24af992c3a733f 100644
+--- a/examples/operators/dsv4_4l/distributed_evidence.py
++++ b/examples/operators/dsv4_4l/distributed_evidence.py
+@@ -85,7 +85,8 @@ def ddp_step_evidence(engine, model):
+     for name, parameter in parameters.items():
+ 
+         def gradient(value, name=name):
+-            records["local_gradients"][name] = tensor_record(value)
++            if value is not None:
++                records["local_gradients"][name] = tensor_record(value)
+             return value
+ 
+         handles.append(parameter.register_hook(gradient))
+diff --git a/examples/operators/dsv4_4l/run_grpo.py b/examples/operators/dsv4_4l/run_grpo.py
+index a18eff864730415e80a65c141b491a4f78060dc8..f975a6b0964c98573e9dddc0392521343b12e4df 100644
+--- a/examples/operators/dsv4_4l/run_grpo.py
++++ b/examples/operators/dsv4_4l/run_grpo.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Run only the selected physical GPUs in an isolated four-device Ray container."""
++"""Run the four- or eight-device recipe in an isolated Ray container."""
++
+ from pathlib import Path
+ import json
+ import subprocess
+@@ -14,10 +15,21 @@ parser.add_argument("data", type=Path)
+ parser.add_argument("output", type=Path)
+ parser.add_argument("cache", type=Path)
+ parser.add_argument("--trace-first", action="store_true")
+-parser.add_argument("--audit-response-length", type=int, default=3)
++parser.add_argument("--audit-response-length", type=int)
+ parser.add_argument("--audit-prompts-file", type=Path)
+ parser.add_argument("--stress-final-repeats", type=int, default=0)
++parser.add_argument("--num-gpus", type=int, choices=(4, 8), default=4)
++parser.add_argument(
++    "--numa-interleave",
++    action="store_true",
++    help="use process-local NUMA interleaving for MI35x hosts with NUMA migration faults",
++)
++parser.add_argument(
++    "--dry-run", action="store_true", help="print the plan without GPU checks, files or containers"
++)
+ args = parser.parse_args()
++if args.audit_response_length is None:
++    args.audit_response_length = 16 if args.num_gpus == 8 else 3
+ if not 1 <= args.audit_response_length <= 16:
+     parser.error("audit response length must be between 1 and 16 for this four-layer recipe")
+ audit_overrides = []
+@@ -38,13 +50,79 @@ if args.audit_prompts_file is not None:
+         parser.error("audit prompts must contain three nonempty strings")
+     audit_overrides.append("rlk.audit_prompts=" + json.dumps(prompts))
+ repo = Path(__file__).resolve().parents[3]
+-for gpu in range(4, 8):
++actor_devices = [0, 1, 2, 3] if args.num_gpus == 8 else [4, 5]
++rollout_devices = [4, 5, 6, 7] if args.num_gpus == 8 else [6, 7]
++config_name = "dsv4_grpo"
++out = args.output.resolve()
++overrides = [
++    "actor_rollout_ref.model.path=/models/4l",
++    "data.train_files=/data/train.parquet",
++    "data.val_files=/data/val.parquet",
++    "data.train_batch_size=2",
++    "actor_rollout_ref.actor.ppo_mini_batch_size=2",
++    "actor_rollout_ref.rollout.n=2",
++    "trainer.total_training_steps=3",
++    f"rlk.audit_response_length={args.audit_response_length}",
++    "trainer.default_local_dir=/outputs/checkpoints",
++    "rlk.sync_dir=/outputs/policy-sync",
++    "data.max_prompt_length=128",
++    "data.max_response_length=16",
++    "data.dataloader_num_workers=0",
++    "reward.num_workers=1",
++    "actor_rollout_ref.rollout.agent.num_workers=1",
++    "reward.custom_reward_function.path=/opt/dsv4/RL-Kernel/examples/operators/dsv4_4l/copy_task.py",
++    "reward.custom_reward_function.name=compute_score",
++    "actor_rollout_ref.rollout.max_model_len=256",
++    "actor_rollout_ref.rollout.max_num_batched_tokens=512",
++    "actor_rollout_ref.rollout.max_num_seqs=8",
++    "actor_rollout_ref.rollout.enable_chunked_prefill=false",
++    f"ray_kwargs.ray_init.num_cpus={48 if args.num_gpus == 8 else 24}",
++    f"+ray_kwargs.ray_init.num_gpus={args.num_gpus}",
++    "+ray_kwargs.ray_init.address=local",
++    "+ray_kwargs.ray_init._temp_dir=/outputs/ray",
++    "hydra.run.dir=/outputs/hydra",
++    "trainer.save_freq=-1",
++    "trainer.total_epochs=1",
++    "data.shuffle=false",
++    *audit_overrides,
++]
++if args.num_gpus == 8:
++    overrides.append("+recipe=dsv4_grpo_8gpu")
++if args.dry_run:
++    print(
++        json.dumps(
++            dict(
++                image=args.image,
++                config_name=config_name,
++                numa_interleave=args.numa_interleave,
++                actor_physical_gpus=actor_devices,
++                rollout_physical_gpus=rollout_devices,
++                output=str(out),
++                command=[
++                    "/opt/dsv4-venv/bin/python",
++                    "-m",
++                    "verl.experimental.rl_kernel.main_ppo",
++                    "--config-name",
++                    config_name,
++                    *overrides,
++                ],
++            ),
++            indent=2,
++        )
++    )
++    raise SystemExit(0)
++for gpu in actor_devices + rollout_devices:
+     subprocess.run(
+         ["python3", str(repo / "examples/operators/dsv4_4l/guard_gpu.py"), str(gpu)], check=True
+     )
+ a = json.loads(
+     subprocess.check_output(
+-        ["python3", str(repo / "examples/operators/dsv4_4l/device_allocation.py"), "4,5", "6,7"],
++        [
++            "python3",
++            str(repo / "examples/operators/dsv4_4l/device_allocation.py"),
++            ",".join(map(str, actor_devices)),
++            ",".join(map(str, rollout_devices)),
++        ],
+         text=True,
+     )
+ )
+@@ -62,6 +140,8 @@ for command, label in [
+ name = "rlk-grpo-" + out.name
+ image = args.image
+ cmd = ["docker", "run", "--rm", "--init", "--name", name, "--device=/dev/kfd"]
++if args.numa_interleave:
++    cmd += ["--cap-add=SYS_NICE"]
+ for d in a:
+     cmd += ["--device=" + d["render_node"]]
+ cmd += [
+@@ -75,7 +155,8 @@ cmd += [
+ env = dict(
+     LD_PRELOAD="/opt/dsv4/lib/rlk-isolated-kfd.so",
+     RLK_ALLOWED_KFD_GPU_IDS=",".join(str(d["kfd_gpu_id"]) for d in a),
+-    HIP_VISIBLE_DEVICES="0,1,2,3",
++    HIP_VISIBLE_DEVICES=",".join(map(str, range(args.num_gpus))),
++    RLK_DEVICE_ALLOCATION="/outputs/device-allocation.json",
+     RLK_TRACE_FIRST_AUDIT=("1" if args.trace_first else "0"),
+     RLK_REPLAY_FIXED_CASES="/data/replay-fixed-sequences.json",
+     DSV4_TRACE_FORMAT="cas-v1",
+@@ -104,48 +185,19 @@ for src, dst, mode in [
+     (args.cache.resolve(), "/cache", "rw"),
+ ]:
+     cmd += ["-v", str(src) + ":" + dst + ":" + mode]
+-args = [
+-    "actor_rollout_ref.model.path=/models/4l",
+-    "data.train_files=/data/train.parquet",
+-    "data.val_files=/data/val.parquet",
+-    "data.train_batch_size=2",
+-    "actor_rollout_ref.actor.ppo_mini_batch_size=2",
+-    "actor_rollout_ref.rollout.n=2",
+-    "trainer.total_training_steps=3",
+-    f"rlk.audit_response_length={args.audit_response_length}",
+-    "trainer.default_local_dir=/outputs/checkpoints",
+-    "rlk.sync_dir=/outputs/policy-sync",
+-    "data.max_prompt_length=128",
+-    "data.max_response_length=16",
+-    "data.dataloader_num_workers=0",
+-    "reward.num_workers=1",
+-    "actor_rollout_ref.rollout.agent.num_workers=1",
+-    "reward.custom_reward_function.path=/opt/dsv4/RL-Kernel/examples/operators/dsv4_4l/copy_task.py",
+-    "reward.custom_reward_function.name=compute_score",
+-    "actor_rollout_ref.rollout.max_model_len=256",
+-    "actor_rollout_ref.rollout.max_num_batched_tokens=512",
+-    "actor_rollout_ref.rollout.max_num_seqs=8",
+-    "actor_rollout_ref.rollout.enable_chunked_prefill=false",
+-    "ray_kwargs.ray_init.num_cpus=24",
+-    "+ray_kwargs.ray_init.num_gpus=4",
+-    "+ray_kwargs.ray_init.address=local",
+-    "+ray_kwargs.ray_init._temp_dir=/outputs/ray",
+-    "hydra.run.dir=/outputs/hydra",
+-    "trainer.save_freq=-1",
+-    "trainer.total_epochs=1",
+-    "data.shuffle=false",
+-]
+-args += audit_overrides
+ cmd += [
+     image,
+     "bash",
+     "-c",
+     (
+         "mkdir -p /outputs/tmp /outputs/ray; cd /opt/dsv4/verl; "
+-        'exec /opt/dsv4-venv/bin/python -m verl.experimental.rl_kernel.main_ppo "$@"'
++        f"exec {'numactl --interleave=all ' if args.numa_interleave else ''}"
++        '/opt/dsv4-venv/bin/python -m verl.experimental.rl_kernel.main_ppo "$@"'
+     ),
+     "grpo",
+-    *args,
++    "--config-name",
++    config_name,
++    *overrides,
+ ]
+ rec = dict(
+     container=name,
+@@ -167,7 +219,14 @@ with (out / "driver.log").open("w") as f:
+     with (out / "gpu-memory.jsonl").open("w") as samples:
+         while proc.poll() is None:
+             sample = subprocess.run(
+-                ["rocm-smi", "-d", "4", "5", "6", "7", "--showmeminfo", "vram", "--json"],
++                [
++                    "rocm-smi",
++                    "-d",
++                    *map(str, actor_devices + rollout_devices),
++                    "--showmeminfo",
++                    "vram",
++                    "--json",
++                ],
+                 capture_output=True,
+                 text=True,
+             )
+diff --git a/examples/operators/dsv4_4l/verify_grpo.py b/examples/operators/dsv4_4l/verify_grpo.py
+index dc353e1d26be9d8dac113830a0ac239b246e3fad..3416787ca3fec0afd7159176d11ebab438622327 100644
+--- a/examples/operators/dsv4_4l/verify_grpo.py
++++ b/examples/operators/dsv4_4l/verify_grpo.py
+@@ -12,8 +12,11 @@ def worker_key(record):
+     return record.get("worker_identity", record["pid"])
+ 
+ 
+-def verify_stress(root, repeats, pids):
+-    from verl.experimental.rl_kernel.trainer_contract import strict_response_parity
++def verify_stress(root, repeats, pids, *, shared_root=None, actor_count=2):
++    from verl.experimental.rl_kernel.trainer_contract import (
++        strict_response_parity,
++        validate_actor_exports,
++    )
+ 
+     summary = json.loads((root / "stress-v3.json").read_text())
+     assert summary["status"] == "PASS"
+@@ -75,9 +78,11 @@ def verify_stress(root, repeats, pids):
+             if len(order) == 2:
+                 assert stage["order"]
+     assert count == summary["expected_tokens"] == summary["compared_tokens"] > 0
+-    expected = json.loads((root / "sync-v3-raw.json").read_text())["manifest"]
++    shared_root = root if shared_root is None else shared_root
++    expected = json.loads((shared_root / "sync-v3-raw.json").read_text())["manifest"]
+     actors = json.loads((root / "stress-v3-actor-readback.json").read_text())
+-    assert len(actors) == 2 and all(
++    validate_actor_exports(actors, actor_count, 3)
++    assert len(actors) == actor_count and all(
+         actor["weight_version"] == 3 and actor["manifest"] == expected for actor in actors
+     )
+     acks = json.loads((root / "stress-v3-rollout-readback.json").read_text())
+@@ -98,9 +103,114 @@ def verify_stress(root, repeats, pids):
+     return summary
+ 
+ 
++def verify_dp_step(ranks, identities, dp_size):
++    """Recheck actual DDP execution and equal post-reduction state per PP stage."""
++    if dp_size == 1:
++        return
++    stages = {}
++    for rank in ranks:
++        identity = identities[rank["rank"]]
++        assert rank["dp_rank"] == identity["dp_rank"]
++        assert rank["pipeline_stage"] == identity["pipeline_stage"]
++        key = (rank["dp_rank"], rank["pipeline_stage"])
++        assert key not in stages
++        stages[key] = rank
++        ddp = rank["ddp_evidence"]
++        assert ddp["dp_replicas"] == dp_size and ddp["native_ddp_finish_calls"]
++        assert ddp["different_local_gradients"] and ddp["reduced_gradients"]
++        assert all(v["finite"] for v in ddp["reduced_gradients"].values())
++        assert not ddp["missing_mhc_backward_parameters"]
++    assert set(stages) == {(d, p) for d in range(dp_size) for p in (0, 1)}
++    for stage in (0, 1):
++        first = stages[0, stage]
++        for dp in range(1, dp_size):
++            other = stages[dp, stage]
++            for key in ("parameter_before", "parameter_after", "gradient_records"):
++                assert other[key] == first[key]
++            assert (
++                other["ddp_evidence"]["reduced_gradients"]
++                == first["ddp_evidence"]["reduced_gradients"]
++            )
++            for state in ("optimizer_before", "optimizer_after"):
++
++                def portable(snapshot):
++                    return {
++                        name: {k: v for k, v in item.items() if k != "data_ptr"}
++                        for name, item in snapshot["state_tensors"].items()
++                    }
++
++                assert portable(other[state]) == portable(first[state])
++                assert other[state]["state_scalars"] == first[state]["state_scalars"]
++
++
+ def verify(root, inventory):
++    from verl.experimental.rl_kernel.cluster_contract import topology
++
++    root = Path(root)
++    config = root.parent / "hydra/.hydra/config.yaml"
++    raw = json.loads((root / "sync-v0-raw.json").read_text())
++    replicas = len(raw.get("replicas", [None]))
++    if replicas == 1:
++        return _verify_replica(root, inventory)
++    if not config.exists():
++        raise ValueError("multi-replica verification requires the resolved Hydra configuration")
++    from omegaconf import OmegaConf
++
++    plan = topology(OmegaConf.load(config))
++    assert plan["rollout_replicas"] == replicas == 2 and plan["actor_dp_size"] == 2
++    results = [
++        _verify_replica(root, inventory, replica_rank=i, actor_count=4) for i in range(replicas)
++    ]
++    placement = json.loads((root / "single-node-placement.json").read_text())
++    from verl.experimental.rl_kernel.cluster_contract import verify_placement
++
++    assert placement["plan"] == plan
++    verify_placement(plan, placement["actor"], placement["rollout"], placement["nodes"])
++    for actor in placement["actor"]:
++        identity = json.loads((root / f"actor-rank-{actor['rank']}-identity.json").read_text())
++        assert identity["pid"] == actor["pid"]
++        assert identity["source_identity"]["node_id"] == actor["node_id"]
++        assert identity["device_identity"]["pci_bus_id"] == actor["pci_bus_id"]
++    from verl.experimental.rl_kernel.trainer_contract import replica_stages
++
++    for replica_rank in range(replicas):
++        for stage in replica_stages(raw, replica_rank):
++            placed = next(
++                r
++                for r in placement["rollout"]
++                if r["replica_rank"] == replica_rank and r["rank"] == stage["pipeline_stage"]
++            )
++            assert worker_key(stage) == placed["worker_identity"]
++            assert stage["node_id"] == placed["node_id"]
++            assert stage["device_identity"]["pci_bus_id"] == placed["pci_bus_id"]
++    for version in range(4):
++        name = "initial-v0.json" if version == 0 else f"post-update-v{version}.json"
++        summary = json.loads((root / name).read_text())
++        assert summary["weight_version"] == summary["global_steps"] == version
++        assert summary["finite"] and summary["batch_invariance"]
++        assert summary["mismatch_count"] == summary["mean_abs_diff"] == summary["max_abs_diff"] == 0
++        assert {r["replica_rank"] for r in summary["replicas"]} == {0, 1}
++        for key in ("expected_tokens", "compared_tokens"):
++            assert summary[key] == sum(result["versions"][version][key] for result in results)
++    summary = dict(
++        status="PASS",
++        scope=(
++            "Single-node eight-GPU four-layer native verl GRPO, "
++            "actor PP2/DP2 and two PP2 rollout replicas."
++        ),
++        dp_gradient_reduction=True,
++        full_quantized_base_training=False,
++        replicas=results,
++    )
++    (root / "grpo-acceptance.json").write_text(json.dumps(summary, indent=2))
++    return summary
++
++
++def _verify_replica(root, inventory, *, replica_rank=0, actor_count=2):
+     from verl.experimental.rl_kernel.trainer_contract import (
+         strict_response_parity,
++        replica_stages,
++        validate_actor_exports,
+         validate_stage_acks,
+     )
+     from examples.operators.dsv4_4l.optimizer_evidence import verify_optimizer_transition
+@@ -110,17 +220,20 @@ def verify(root, inventory):
+     original = json.loads(Path(inventory).read_text())
+     original_state = original["sync_eligible_original_tensors"]
+     root = Path(root)
++    audit_root = root if actor_count == 2 else root / f"replica-{replica_rank}"
++    dp_size = actor_count // 2
+     job = root.parent
+     if json.loads((job / "exit-code.json").read_text())["exit_code"] != 0:
+         raise ValueError("training process did not exit successfully")
+-    fixed = json.loads((root / "fixed-sequences.json").read_text())
++    fixed = json.loads((audit_root / "fixed-sequences.json").read_text())
+     if len(fixed) != 3 or {c["id"] for c in fixed} != set("ABC"):
+         raise ValueError("all three fixed cases required")
+     versions = []
+     pids = None
+     previous_actor = {}
+     identities = {
+-        i: json.loads((root / f"actor-rank-{i}-identity.json").read_text()) for i in (0, 1)
++        i: json.loads((root / f"actor-rank-{i}-identity.json").read_text())
++        for i in range(actor_count)
+     }
+     orders = [
+         ("A",),
+@@ -141,6 +254,15 @@ def verify(root, inventory):
+     for version in range(4):
+         sync = json.loads((root / f"sync-v{version}.json").read_text())
+         rawsync = json.loads((root / f"sync-v{version}-raw.json").read_text())
++        sync["stages"] = replica_stages(sync, replica_rank)
++        rawsync["stages"] = replica_stages(rawsync, replica_rank)
++        if actor_count > 2:
++            export = validate_actor_exports(rawsync["actor_exports"], actor_count, version)
++            assert export["manifest"] == rawsync["manifest"]
++            for exported in rawsync["actor_exports"]:
++                identity = identities[exported["rank"]]
++                assert exported["dp_rank"] == identity["dp_rank"]
++                assert exported["pipeline_stage"] == identity["pipeline_stage"]
+         assert sync["weight_version"] == rawsync["stages"][0]["weight_version"] == version
+         pids = validate_stage_acks(sync["stages"], rawsync["manifest"], version, pids)
+         assert {s["pipeline_stage"]: s["original_layer_ids"] for s in sync["stages"]} == {
+@@ -157,7 +279,7 @@ def verify(root, inventory):
+             )
+             if version == 0:
+                 assert rawsync["manifest"][key]["sha256"] == item["sha256"]
+-        path = root / ("initial-v0.json" if version == 0 else f"post-update-v{version}.json")
++        path = audit_root / ("initial-v0.json" if version == 0 else f"post-update-v{version}.json")
+         audit = json.loads(path.read_text())
+         assert audit["weight_version"] == version and audit["global_steps"] == version
+         assert audit["batch_invariance"] and audit["finite"]
+@@ -187,7 +309,20 @@ def verify(root, inventory):
+         assert len(audit["rows"]) == len(expected_labels)
+         expected = compared = 0
+         for row in audit["rows"]:
+-            raw = torch.load(root / row["evidence_file"], map_location="cpu", weights_only=True)
++            raw = torch.load(
++                audit_root / row["evidence_file"], map_location="cpu", weights_only=True
++            )
++            if actor_count > 2:
++                assert raw["replica_rank"] == replica_rank
++                assert raw["actor_dp_ranks"] == list(range(dp_size))
++                assert (
++                    len(raw["actor_dp_scores"]) == len(raw["actor_dp_forward_batches"]) == dp_size
++                )
++                for scores, batches in zip(
++                    raw["actor_dp_scores"], raw["actor_dp_forward_batches"], strict=True
++                ):
++                    strict_response_parity(scores, raw["actor"], torch.ones_like(scores))
++                    assert batches == raw["actor_forward_batches"]
+             checked = strict_response_parity(
+                 raw["actor"], raw["rollout"], torch.ones_like(raw["actor"], dtype=torch.bool)
+             )
+@@ -273,7 +408,7 @@ def verify(root, inventory):
+                 scores["old_log_probs"], scores["rollout_log_probs"], scores["response_mask"]
+             )
+             ranks = []
+-            for rank in (0, 1):
++            for rank in range(actor_count):
+                 actor = json.loads((root / f"actor-rank-{rank}-v{version}.json").read_text())
+                 assert actor["rank"] == rank and actor["weight_version"] == version
+                 assert (
+@@ -302,8 +437,8 @@ def verify(root, inventory):
+                 loss_calls = json.loads(
+                     (root / f"native-loss-rank{rank}-v{version}.json").read_text()
+                 )
+-                if rank == 1:
+-                    assert len(loss_calls) == 4 and all(
++                if identities[rank].get("pipeline_stage", rank) == 1:
++                    assert len(loss_calls) == 4 // dp_size and all(
+                         c["finite"]
+                         and c["requires_grad"]
+                         and c["callable"] == "verl.workers.utils.losses.ppo_loss"
+@@ -313,21 +448,31 @@ def verify(root, inventory):
+                     assert loss_calls == []
+                 previous_actor[rank] = actor["optimizer_after"]
+                 ranks.append(actor)
+-            for send, recv in [
+-                ("forward_send", "forward_recv"),
+-                ("backward_recv", "backward_send"),
+-            ]:
+-                left = [r for r in ranks[0]["pipeline_transfers"] if r["direction"] == send]
+-                right = [r for r in ranks[1]["pipeline_transfers"] if r["direction"] == recv]
+-                assert left and right and len(left) == len(right) == 4
+-                assert all(r["finite"] for r in left + right)
+-                assert [r["sha256"] for r in sorted(left, key=lambda r: r["microbatch"])] == [
+-                    r["sha256"] for r in sorted(right, key=lambda r: r["microbatch"])
+-                ]
+-                if send.startswith("backward"):
+-                    assert any(r["nonzero"] for r in left)
++            verify_dp_step(ranks, identities, dp_size)
++            for dp in range(dp_size):
++                stages = {
++                    identities[r["rank"]].get("pipeline_stage", r["rank"]): r
++                    for r in ranks
++                    if identities[r["rank"]].get("dp_rank", 0) == dp
++                }
++                assert set(stages) == {0, 1}
++                for send, recv in [
++                    ("forward_send", "forward_recv"),
++                    ("backward_recv", "backward_send"),
++                ]:
++                    left = [r for r in stages[0]["pipeline_transfers"] if r["direction"] == send]
++                    right = [r for r in stages[1]["pipeline_transfers"] if r["direction"] == recv]
++                    assert left and right and len(left) == len(right) == 4 // dp_size
++                    assert all(r["finite"] and r["dp_rank"] == dp for r in left + right)
++                    assert [r["sha256"] for r in sorted(left, key=lambda r: r["microbatch"])] == [
++                        r["sha256"] for r in sorted(right, key=lambda r: r["microbatch"])
++                    ]
++                    if send.startswith("backward"):
++                        assert any(r["nonzero"] for r in left)
+             metrics = json.loads((root / f"metrics-step{version}.json").read_text())
+             assert metrics["global_steps"] == version and metrics["includes_audit"]
++            if actor_count > 2:
++                assert metrics["rollout_gpus"] == 4 and metrics["total_job_gpus"] == 8
+     parity = [json.loads(line) for line in (root / "parity.jsonl").read_text().splitlines()]
+     assert len(parity) == 7 and all(
+         r["expected_tokens"] == r["compared_tokens"] > 0 and r["mismatch_count"] == 0
+@@ -340,7 +485,9 @@ def verify(root, inventory):
+ 
+         repeats = int(OmegaConf.load(config).rlk.get("stress_final_repeats", 0))
+         if repeats:
+-            stress = verify_stress(root, repeats, pids)
++            stress = verify_stress(
++                audit_root, repeats, pids, shared_root=root, actor_count=actor_count
++            )
+     placement = None
+     if config.exists():
+         from omegaconf import OmegaConf
+@@ -350,7 +497,8 @@ def verify(root, inventory):
+             from verl.experimental.rl_kernel.cluster_contract import topology, verify_placement
+ 
+             pre = json.loads((root / "cluster-preflight.json").read_text())
+-            assert pre["plan"] == topology(declared)
++            current_plan = topology(declared)
++            assert all(current_plan[key] == val for key, val in pre["plan"].items())
+             observed = json.loads((root / "cluster-placement.json").read_text())
+             placement = verify_placement(
+                 pre["plan"], observed["actor"], observed["rollout"], pre["nodes"]
+@@ -375,15 +523,15 @@ def verify(root, inventory):
+         placement=placement,
+         scope=(
+             ("Explicit multi-node four-GPU, " if placement else "Single-node four-GPU, ")
+-            + "four-layer actor PP2/DP1 and rollout PP2/DP1; "
++            + f"four-layer actor PP2/DP{dp_size}, rollout replica {replica_rank} PP2/DP1; "
+             "three continuous native verl GRPO/PPO updates."
+         ),
+         versions=versions,
+-        dp_gradient_reduction=False,
++        dp_gradient_reduction=dp_size > 1,
+         full_quantized_base_training=False,
+         additional_v3_stress=stress,
+     )
+-    (root / "grpo-acceptance.json").write_text(json.dumps(result, indent=2))
++    (audit_root / "grpo-acceptance.json").write_text(json.dumps(result, indent=2))
+     return result
+ 
+ 
+diff --git a/tests/integrations/common/test_eight_gpu_grpo.py b/tests/integrations/common/test_eight_gpu_grpo.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..119a380048aed32552161c12041c7f66982496bf
+--- /dev/null
++++ b/tests/integrations/common/test_eight_gpu_grpo.py
+@@ -0,0 +1,136 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU checks of the launch plan and DP evidence validation, without a GPU job."""
++
++import copy
++import json
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++
++from examples.operators.dsv4_4l.verify_grpo import verify_dp_step
++
++ROOT = Path(__file__).resolve().parents[3]
++
++
++@pytest.mark.parametrize("gpus", [4, 8])
++def test_dry_run_does_not_require_devices_or_create_output(tmp_path, gpus):
++    output = tmp_path / "not-created"
++    result = subprocess.run(
++        [
++            sys.executable,
++            str(ROOT / "examples/operators/dsv4_4l/run_grpo.py"),
++            "review-image",
++            "missing-checkpoint",
++            "missing-data",
++            str(output),
++            "missing-cache",
++            "--num-gpus",
++            str(gpus),
++            "--dry-run",
++        ],
++        capture_output=True,
++        text=True,
++        check=True,
++    )
++    plan = json.loads(result.stdout)
++    assert not output.exists()
++    assert len(plan["actor_physical_gpus"]) == len(plan["rollout_physical_gpus"]) == gpus // 2
++    assert len(set(plan["actor_physical_gpus"] + plan["rollout_physical_gpus"])) == gpus
++    command = plan["command"]
++    assert "data.train_batch_size=2" in command and "actor_rollout_ref.rollout.n=2" in command
++    assert f"+ray_kwargs.ray_init.num_gpus={gpus}" in command
++    if gpus == 8:
++        assert "+recipe=dsv4_grpo_8gpu" in command
++        assert "rlk.audit_response_length=16" in command
++        assert plan["actor_physical_gpus"] == [0, 1, 2, 3]
++    else:
++        assert plan["config_name"] == "dsv4_grpo"
++        assert "rlk.audit_response_length=3" in command
++        assert plan["actor_physical_gpus"] == [4, 5]
++
++
++def dp_records():
++    identities, ranks = {}, []
++    for rank in range(4):
++        identities[rank] = dict(dp_rank=rank % 2, pipeline_stage=rank // 2)
++        tensor = dict(sha256=f"stage-{rank // 2}", finite=True)
++        optimizer = dict(
++            state_tensors={"moment": dict(tensor, data_ptr=rank)}, state_scalars={"step": 1}
++        )
++        ranks.append(
++            dict(
++                rank=rank,
++                **identities[rank],
++                parameter_before={"p": "old"},
++                parameter_after={"p": "new"},
++                gradient_records={"p": tensor},
++                optimizer_before=optimizer,
++                optimizer_after=optimizer,
++                ddp_evidence=dict(
++                    dp_replicas=2,
++                    native_ddp_finish_calls=["native"],
++                    different_local_gradients=True,
++                    reduced_gradients={"p": tensor},
++                    missing_mhc_backward_parameters=[],
++                ),
++            )
++        )
++    return ranks, identities
++
++
++def test_dp_state_checks_compare_hashes_and_ignore_process_pointers():
++    verify_dp_step(*dp_records(), 2)
++
++
++@pytest.mark.parametrize(
++    "corruption", ["parameter", "gradient", "optimizer", "no_reduce", "same_local", "missing_rank"]
++)
++def test_bad_dp_evidence_is_rejected(corruption):
++    ranks, identities = copy.deepcopy(dp_records())
++    if corruption == "parameter":
++        ranks[1]["parameter_after"]["p"] = "bad"
++    elif corruption == "gradient":
++        ranks[1]["ddp_evidence"]["reduced_gradients"]["p"]["sha256"] = "bad"
++    elif corruption == "optimizer":
++        ranks[1]["optimizer_after"]["state_scalars"]["step"] = 2
++    elif corruption == "no_reduce":
++        ranks[1]["ddp_evidence"]["native_ddp_finish_calls"] = []
++    elif corruption == "same_local":
++        ranks[1]["ddp_evidence"]["different_local_gradients"] = False
++    else:
++        ranks.pop()
++    with pytest.raises(AssertionError):
++        verify_dp_step(ranks, identities, 2)
++
++
++def test_dp_observer_preserves_optional_backward_gradients():
++    torch = pytest.importorskip("torch")
++    from types import SimpleNamespace
++
++    from examples.operators.dsv4_4l.distributed_evidence import ddp_step_evidence
++
++    class OptionalInput(torch.autograd.Function):
++        @staticmethod
++        def forward(ctx, active, unused):
++            ctx.set_materialize_grads(False)
++            return active * 2
++
++        @staticmethod
++        def backward(ctx, gradient):
++            return gradient * 2, None
++
++    model = torch.nn.Module()
++    model.active = torch.nn.Parameter(torch.tensor(3.0))
++    model.unused = torch.nn.Parameter(torch.tensor(5.0))
++    engine = SimpleNamespace(module=[], optimizer_step=lambda: None)
++    original_step = engine.optimizer_step
++    with ddp_step_evidence(engine, model) as evidence:
++        OptionalInput.apply(model.active, model.unused).backward()
++    assert torch.equal(model.active.grad, torch.tensor(2.0))
++    assert model.unused.grad is None
++    assert set(evidence["local_gradients"]) == {"active"}
++    assert evidence["local_gradients"]["active"]["finite"]
++    assert evidence["local_gradients"]["active"]["nonzero"]
++    assert engine.optimizer_step is original_step

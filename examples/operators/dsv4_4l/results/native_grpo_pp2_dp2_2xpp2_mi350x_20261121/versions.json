@@ -1,0 +1,52 @@
+{
+  "sources": {
+    "RL-Kernel": {
+      "base": "71c7cb2d033806632cef1a3678939bf73dc581dd",
+      "tested_head": "6df8e1d8257859e9aae00b31d3d60b011024b954",
+      "changed_files": [
+        "examples/operators/dsv4_4l/distributed_evidence.py",
+        "examples/operators/dsv4_4l/run_grpo.py",
+        "examples/operators/dsv4_4l/verify_grpo.py",
+        "tests/integrations/common/test_eight_gpu_grpo.py"
+      ]
+    },
+    "verl": {
+      "base": "d154f5aa3d9a5a19210bc2df499db6ef6532db90",
+      "tested_head": "7c6dc4922c02fa8c0e1023acd26789f7de875b51",
+      "changed_files": [
+        "tests/experimental/rl_kernel/test_eight_gpu_on_cpu.py",
+        "tests/experimental/rl_kernel/test_multinode_contract_on_cpu.py",
+        "verl/experimental/rl_kernel/acceptance.py",
+        "verl/experimental/rl_kernel/cluster.py",
+        "verl/experimental/rl_kernel/cluster_contract.py",
+        "verl/experimental/rl_kernel/config/recipe/dsv4_grpo_8gpu.yaml",
+        "verl/experimental/rl_kernel/trainer.py",
+        "verl/experimental/rl_kernel/trainer_contract.py",
+        "verl/experimental/rl_kernel/trainer_engine.py",
+        "verl/experimental/rl_kernel/trainer_rollout.py",
+        "verl/experimental/rl_kernel/trainer_sync.py"
+      ]
+    }
+  },
+  "dependencies": {
+    "vllm": "c07d58dc82d75f7d1a947b3264b460384ec3e18d",
+    "Megatron-LM": "97b50bdd936022ef58031c35db6d10581c181be0",
+    "torch": "2.13.0+rocm10.0.0",
+    "triton": "3.8.0+git669b31ac",
+    "TransformerEngine": "2.21.0.dev0"
+  },
+  "image": {
+    "tag": "rlk/dsv4-4l-mi35x:8gpu-004",
+    "id": "sha256:a2868c2822cabcbdbf40b3489002eb1edc9d524b6e5be9e0d77e9c8ec8618dff",
+    "availability": "Local validation image; not published to a registry."
+  },
+  "host_driver": {
+    "kernel": "6.9.0-0_fbk10_brcmrdma13_141_g9b20106afb70",
+    "amdgpu_version": "6.16.13"
+  },
+  "model": {
+    "repository": "RL-Align/DeepSeek-V4-Flash-4L",
+    "revision": "4cdbf146efa5e2248349cfa33d4bfb54447c6dfd",
+    "checkpoint_sha256": "1bd423ab1d98f43d40b19617fcb30d973d94436cc7b150fe3f744de79c2de086"
+  }
+}

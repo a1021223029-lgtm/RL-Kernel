@@ -1,0 +1,232 @@
+{
+  "status": "PASS",
+  "topology": {
+    "node_count": 1,
+    "gpu_count": 8,
+    "actor": "4 GPUs PP2 x DP2",
+    "rollout": "4 GPUs, two independent PP2 replicas",
+    "TP": 1,
+    "EP": 1,
+    "CP": 1
+  },
+  "completed_native_optimizer_steps": 3,
+  "training_exit_code": 0,
+  "independent_verifier_exit_code": 0,
+  "version_audits": [
+    {
+      "weight_version": 0,
+      "global_steps": 0,
+      "expected_tokens": 2376,
+      "compared_tokens": 2376,
+      "mismatch_count": 0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "finite": true,
+      "batch_invariance": true
+    },
+    {
+      "weight_version": 1,
+      "global_steps": 1,
+      "expected_tokens": 2376,
+      "compared_tokens": 2376,
+      "mismatch_count": 0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "finite": true,
+      "batch_invariance": true
+    },
+    {
+      "weight_version": 2,
+      "global_steps": 2,
+      "expected_tokens": 2376,
+      "compared_tokens": 2376,
+      "mismatch_count": 0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "finite": true,
+      "batch_invariance": true
+    },
+    {
+      "weight_version": 3,
+      "global_steps": 3,
+      "expected_tokens": 2376,
+      "compared_tokens": 2376,
+      "mismatch_count": 0,
+      "mean_abs_diff": 0.0,
+      "max_abs_diff": 0.0,
+      "finite": true,
+      "batch_invariance": true
+    }
+  ],
+  "ddp_updates": [
+    {
+      "step": 1,
+      "actors": [
+        {
+          "rank": 0,
+          "dp_rank": 0,
+          "pipeline_stage": 0,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 58,
+          "changed_parameters": 38
+        },
+        {
+          "rank": 1,
+          "dp_rank": 1,
+          "pipeline_stage": 0,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 58,
+          "changed_parameters": 38
+        },
+        {
+          "rank": 2,
+          "dp_rank": 0,
+          "pipeline_stage": 1,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 25,
+          "changed_parameters": 16
+        },
+        {
+          "rank": 3,
+          "dp_rank": 1,
+          "pipeline_stage": 1,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 25,
+          "changed_parameters": 16
+        }
+      ]
+    },
+    {
+      "step": 2,
+      "actors": [
+        {
+          "rank": 0,
+          "dp_rank": 0,
+          "pipeline_stage": 0,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 58,
+          "changed_parameters": 39
+        },
+        {
+          "rank": 1,
+          "dp_rank": 1,
+          "pipeline_stage": 0,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 58,
+          "changed_parameters": 39
+        },
+        {
+          "rank": 2,
+          "dp_rank": 0,
+          "pipeline_stage": 1,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 25,
+          "changed_parameters": 16
+        },
+        {
+          "rank": 3,
+          "dp_rank": 1,
+          "pipeline_stage": 1,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 25,
+          "changed_parameters": 16
+        }
+      ]
+    },
+    {
+      "step": 3,
+      "actors": [
+        {
+          "rank": 0,
+          "dp_rank": 0,
+          "pipeline_stage": 0,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 58,
+          "changed_parameters": 39
+        },
+        {
+          "rank": 1,
+          "dp_rank": 1,
+          "pipeline_stage": 0,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 58,
+          "changed_parameters": 39
+        },
+        {
+          "rank": 2,
+          "dp_rank": 0,
+          "pipeline_stage": 1,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 25,
+          "changed_parameters": 16
+        },
+        {
+          "rank": 3,
+          "dp_rank": 1,
+          "pipeline_stage": 1,
+          "native_ddp_finish_calls": 1,
+          "reduced_gradient_tensors": 25,
+          "changed_parameters": 16
+        }
+      ]
+    }
+  ],
+  "full_quantized_base_training": false,
+  "driver_traces": {
+    "post_reboot_smoke": {
+      "count_events": 24,
+      "bounds_events": 24,
+      "queue_min": 1,
+      "queue_max": 2,
+      "underflow_events": 0,
+      "recorded_process_packet_overflows": 0,
+      "trace_buffer_header": [
+        "# entries-in-buffer/entries-written: 48/48   #P:384"
+      ]
+    },
+    "three_step_grpo": {
+      "count_events": 556,
+      "bounds_events": 556,
+      "queue_min": 1,
+      "queue_max": 7,
+      "underflow_events": 0,
+      "recorded_process_packet_overflows": 0,
+      "trace_buffer_header": [
+        "# entries-in-buffer/entries-written: 1112/1112   #P:384"
+      ]
+    },
+    "post_training_smoke": {
+      "count_events": 24,
+      "bounds_events": 24,
+      "queue_min": 1,
+      "queue_max": 2,
+      "underflow_events": 0,
+      "recorded_process_packet_overflows": 0,
+      "trace_buffer_header": [
+        "# entries-in-buffer/entries-written: 48/48   #P:384"
+      ]
+    }
+  },
+  "postboot_kernel_runlist_overflow_count": 0,
+  "postboot_kernel_gpu_reset_count": 0,
+  "audit_counts_note": "Token counts are audit comparison observations across fixed/fresh cases, batching/orders, DP actors and rollout replicas, not the count of newly generated training tokens.",
+  "driver_diagnosis": {
+    "pci_bus_id": "0000:88:00.0",
+    "active_queue_count": 4294967295,
+    "active_cp_queue_count": 4294967295,
+    "allocated_runlist_bytes": 72,
+    "first_process_packet_bytes": 84,
+    "minimal_reproduction": "A single-GPU torch.ones(1, device=\"cuda\") failed without Ray or model loading; the other seven GPUs passed.",
+    "four_gpu_control": "Four GPUs including the affected GPU also failed on this host; historical four-GPU acceptance used another host/image.",
+    "recovery": "Authorized host reboot and explicit reload of the same installed amdgpu 6.16.13 module.",
+    "initial_underflow_trigger": "Not established; this report does not claim a permanent upstream driver fix.",
+    "post_training_eight_gpu_smoke": "PASS"
+  },
+  "dp2_observer_fix": {
+    "authorship": "Agent-authored adaptation during this validation, based on an existing pre-eight-GPU baseline hook; maintainer review is requested.",
+    "change": "Preserve None callbacks and record only real gradients, matching the existing received hook in verl/experimental/rl_kernel/trainer_engine.py.",
+    "checks": "Required backward, native DDP finish, distinct local gradients, reduced-gradient identity and effective optimizer-gradient checks remain enabled.",
+    "regression": "9 existing CPU cases plus 1 new real-autograd regression passed locally and in the final image; Ruff passed. The new case failed with the original AttributeError before the fix.",
+    "none_callback_origin": "The failing callback did not log the parameter responsible; its parameter-specific origin has not been established."
+  }
+}

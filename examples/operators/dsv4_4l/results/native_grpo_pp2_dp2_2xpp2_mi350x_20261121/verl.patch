@@ -1,0 +1,1108 @@
+diff --git a/tests/experimental/rl_kernel/test_eight_gpu_on_cpu.py b/tests/experimental/rl_kernel/test_eight_gpu_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..99167d8c817d26f04ec124a9519c8be322fda8ea
+--- /dev/null
++++ b/tests/experimental/rl_kernel/test_eight_gpu_on_cpu.py
+@@ -0,0 +1,319 @@
++# SPDX-License-Identifier: Apache-2.0
++import asyncio
++import copy
++import importlib.util
++import json
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[3] / "verl/experimental/rl_kernel"
++PACKAGE = "_rlk_eight_gpu_tests"
++package = types.ModuleType(PACKAGE)
++package.__path__ = [str(ROOT)]
++sys.modules[PACKAGE] = package
++
++
++def load(name):
++    spec = importlib.util.spec_from_file_location(f"{PACKAGE}.{name}", ROOT / f"{name}.py")
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++cluster = load("cluster_contract")
++contract = load("trainer_contract")
++sync_module = load("trainer_sync")
++
++
++def config(gpus=4):
++    return dict(
++        rlk={},
++        trainer=dict(nnodes=1, n_gpus_per_node=gpus),
++        actor_rollout_ref=dict(rollout=dict(nnodes=1, n_gpus_per_node=gpus)),
++    )
++
++
++def exports(version=0):
++    return [
++        dict(
++            rank=rank,
++            dp_rank=rank // 2,
++            pipeline_stage=rank % 2,
++            weight_version=version,
++            manifest={"a": dict(sha256="abc", dtype="torch.float32", shape=[1])},
++        )
++        for rank in range(4)
++    ]
++
++
++def test_eight_gpu_layout_and_placement():
++    plan = cluster.topology(config())
++    assert (plan["actor_world_size"], plan["actor_dp_size"], plan["rollout_replicas"]) == (4, 2, 2)
++    actors = [dict(rank=i, node_id="node", pci_bus_id=f"gpu{i}") for i in range(4)]
++    rollouts = [dict(rank=i % 2, replica_rank=i // 2, node_id="node", pci_bus_id=f"gpu{i + 4}") for i in range(4)]
++    cluster.verify_placement(plan, actors, rollouts, {"node": "10.0.0.1"})
++    rollouts[-1]["replica_rank"] = 0
++    with pytest.raises(RuntimeError, match="missing or duplicate"):
++        cluster.verify_placement(plan, actors, rollouts, {"node": "10.0.0.1"})
++
++
++@pytest.mark.parametrize("side", ["actor", "rollout"])
++def test_mixed_or_multinode_eight_gpu_layout_fails(side):
++    c = config()
++    settings = c["trainer"] if side == "actor" else c["actor_rollout_ref"]["rollout"]
++    settings["n_gpus_per_node"] = 2
++    with pytest.raises(ValueError):
++        cluster.topology(c)
++    c = config()
++    c["rlk"]["multinode"] = True
++    with pytest.raises(ValueError):
++        cluster.topology(c)
++
++
++@pytest.mark.parametrize("failure", ["missing", "duplicate", "version", "manifest", "coordinate"])
++def test_actor_export_requires_every_rank_and_identical_policy(failure):
++    rows = exports()
++    contract.validate_actor_exports(rows, 4, 0)
++    if failure == "missing":
++        rows.pop()
++    elif failure == "duplicate":
++        rows[-1]["rank"] = 0
++    elif failure == "version":
++        rows[-1]["weight_version"] = 1
++    elif failure == "manifest":
++        rows[-1]["manifest"] = {}
++    else:
++        rows[-1]["dp_rank"] = 0
++    with pytest.raises(RuntimeError):
++        contract.validate_actor_exports(rows, 4, 0)
++
++
++def test_actor_audit_covers_both_dp_outputs():
++    rows = [None, dict(dp_rank=1, weight_version=2), None, dict(dp_rank=0, weight_version=2)]
++    assert [r["dp_rank"] for r in contract.select_actor_scores(rows, 2, 2)] == [0, 1]
++    for bad in (rows[:-1], [rows[1], rows[1]]):
++        with pytest.raises(RuntimeError):
++            contract.select_actor_scores(bad, 2, 2)
++
++
++def test_hydra_eight_gpu_recipe_keeps_accepted_workload(tmp_path):
++    from hydra import compose, initialize_config_dir
++
++    search = (ROOT.parents[1] / "trainer/config").as_posix()
++    with initialize_config_dir(config_dir=str(ROOT / "config"), version_base=None):
++        c = compose(
++            config_name="dsv4_grpo",
++            overrides=[
++                "+recipe=dsv4_grpo_8gpu",
++                f"hydra.searchpath=[file://{search}]",
++                f"rlk.sync_dir={tmp_path.as_posix()}",
++                "actor_rollout_ref.model.path=/models/4l",
++                "data.train_files=/data/train.parquet",
++                "data.val_files=/data/val.parquet",
++            ],
++        )
++    contract.validate_trainer_config(c)
++    assert cluster.topology(c)["actor_dp_size"] == 2
++    assert c.actor_rollout_ref.rollout.data_parallel_size == 1
++    assert c.data.train_batch_size == c.actor_rollout_ref.actor.ppo_mini_batch_size == 2
++    assert c.actor_rollout_ref.rollout.n == 2 and c.trainer.total_training_steps == 3
++    assert c.data.max_prompt_length == 128 and c.data.max_response_length == 16
++    r = c.actor_rollout_ref.rollout
++    assert (r.max_model_len, r.max_num_batched_tokens, r.max_num_seqs) == (256, 512, 8)
++    assert (r.temperature, r.top_p, r.top_k, r.seed) == (1.0, 1.0, -1, 42)
++    assert c.actor_rollout_ref.actor.optim.lr == 1e-6
++
++
++class Remote:
++    def __init__(self, function):
++        self.remote = function
++
++
++class Server:
++    def __init__(self, replica, events, *, fail=False):
++        self.replica = replica
++        self.events = events
++        self.fail = fail
++        self.abort_all_requests = Remote(self.abort)
++        self.rlk_load_policy = Remote(self.load)
++        self.resume_generation = Remote(self.resume)
++
++    async def abort(self, **kwargs):
++        self.events.append(("abort", self.replica))
++
++    async def load(self, path, version):
++        self.events.append(("load", self.replica))
++        if self.fail:
++            raise RuntimeError("injected load failure")
++        return [
++            dict(
++                pipeline_stage=p,
++                pid=100 + 2 * self.replica + p,
++                weight_version=version,
++                parameter_load_completed=True,
++                verified_original_tensors=exports()[0]["manifest"]
++                if p == 0
++                else {"b": dict(sha256="def", dtype="torch.float32", shape=[1])},
++            )
++            for p in (0, 1)
++        ]
++
++    async def resume(self):
++        self.events.append(("resume", self.replica))
++
++
++@pytest.mark.parametrize("fail", [False, True])
++def test_two_replica_sync_barrier_and_failure_keeps_admission_closed(tmp_path, fail):
++    events = []
++    rows = exports()
++    for row in rows:
++        row["manifest"]["b"] = dict(sha256="def", dtype="torch.float32", shape=[1])
++
++    def export(path):
++        Path(path).write_text("policy")
++        events.append(("export", 0))
++        return copy.deepcopy(rows)
++
++    actor = types.SimpleNamespace(rlk_export_policy=export)
++    servers = [Server(i, events, fail=fail and i == 1) for i in range(2)]
++    sync = sync_module.RLKPolicySync(actor, servers, str(tmp_path), actor_world_size=4, rollout_replicas=2)
++    if fail:
++        with pytest.raises(RuntimeError, match="injected"):
++            asyncio.run(sync.update(0))
++        assert not any(e[0] == "resume" for e in events)
++        assert sync.version is None
++        assert not (tmp_path / "sync-v0.json").exists()
++    else:
++        asyncio.run(sync.update(0))
++        assert len(sync.replica_pids) == 2 and sync.version == 0
++        assert events.index(("export", 0)) > max(events.index(("abort", i)) for i in range(2))
++        assert min(events.index(("resume", i)) for i in range(2)) > max(events.index(("load", i)) for i in range(2))
++        record = json.loads((tmp_path / "sync-v0-raw.json").read_text())
++        assert {r["replica_rank"] for r in record["replicas"]} == {0, 1}
++        assert len(record["actor_exports"]) == 4
++
++
++def test_bad_second_replica_readback_never_resumes(tmp_path):
++    events = []
++    rows = exports()
++    for row in rows:
++        row["manifest"]["b"] = dict(sha256="def", dtype="torch.float32", shape=[1])
++    actor = types.SimpleNamespace(rlk_export_policy=lambda path: rows)
++    servers = [Server(i, events) for i in range(2)]
++
++    async def corrupted(path, version):
++        acks = await servers[1].load(path, version)
++        acks[1]["verified_original_tensors"]["b"]["sha256"] = "bad"
++        return acks
++
++    servers[1].rlk_load_policy = Remote(corrupted)
++    sync = sync_module.RLKPolicySync(actor, servers, str(tmp_path), actor_world_size=4, rollout_replicas=2)
++    with pytest.raises(RuntimeError, match="complete actor state"):
++        asyncio.run(sync.update(0))
++    assert not any(e[0] == "resume" for e in events)
++    assert sync.version is None
++
++
++def test_continuous_v0_to_v3_sync_and_worker_restart_rejection(tmp_path):
++    events = []
++    version = 0
++
++    def export(path):
++        Path(path).write_text("policy")
++        rows = exports(version)
++        for row in rows:
++            row["manifest"]["b"] = dict(sha256="def", dtype="torch.float32", shape=[1])
++        return rows
++
++    servers = [Server(i, events) for i in range(2)]
++    actor = types.SimpleNamespace(rlk_export_policy=export)
++    sync = sync_module.RLKPolicySync(actor, servers, str(tmp_path), actor_world_size=4, rollout_replicas=2)
++    for version in range(4):
++        asyncio.run(sync.update(version))
++        assert sync.version == version
++    assert len(list(tmp_path.glob("sync-v[0-3].json"))) == 4
++    assert all((tmp_path / f"policy-v{i}.pt").exists() for i in range(1, 4))
++    version = 4
++    servers[1].replica = 5
++    before = len([e for e in events if e[0] == "resume"])
++    with pytest.raises(RuntimeError, match="PIDs changed"):
++        asyncio.run(sync.update(version))
++    assert sync.version == 3
++    assert len([e for e in events if e[0] == "resume"]) == before
++
++
++@pytest.mark.parametrize("corrupt_dp", [False, True])
++def test_live_audit_checks_each_rollout_and_actor_dp(tmp_path, monkeypatch, corrupt_dp):
++    import torch
++
++    audit = load("acceptance")
++    monkeypatch.setitem(sys.modules, "ray", types.SimpleNamespace(get=lambda value: value))
++
++    def score(cases, version, micro, *trace):
++        replies = []
++        for dp in range(2):
++            scores = [torch.full((len(case["response_ids"]),), -1.0) for case in cases]
++            if corrupt_dp and dp == 1:
++                scores[0].view(torch.int32)[0] ^= 1
++            length = max(len(c["prompt_ids"]) + len(c["response_ids"]) for c in cases)
++            tokens = [
++                c["prompt_ids"] + c["response_ids"] + [0] * (length - len(c["prompt_ids"]) - len(c["response_ids"]))
++                for c in cases
++            ]
++            replies.append(
++                dict(
++                    dp_rank=dp,
++                    weight_version=version,
++                    scores=scores,
++                    forward_batches=[dict(shape=[len(cases), length], tokens=tokens)],
++                )
++            )
++        return replies
++
++    class AuditServer:
++        def __init__(self, replica):
++            self.replica = replica
++            self.requests = 0
++            self.generate = Remote(self.fresh)
++            self.rlk_score_sequences = Remote(self.score)
++
++        async def fresh(self, **kwargs):
++            self.requests += 1
++            return types.SimpleNamespace(
++                token_ids=[7 + self.replica, 8], log_probs=[-1.0, -1.0], extra_fields=dict(global_steps=0)
++            )
++
++        def score(self, cases, label):
++            return dict(global_steps=0, scores=[[-1.0] * len(c["response_ids"]) for c in cases], stages=[])
++
++    c = config()
++    c["rlk"].update(sync_dir=str(tmp_path), audit_prompts=["AAA", "BB", "C"], audit_response_length=16)
++    from omegaconf import OmegaConf
++
++    servers = [AuditServer(i) for i in range(2)]
++    trainer = types.SimpleNamespace(
++        config=OmegaConf.create(c),
++        checkpoint_manager=types.SimpleNamespace(version=0),
++        global_steps=0,
++        tokenizer=types.SimpleNamespace(encode=lambda p, **kwargs: [1] * len(p)),
++        actor_rollout_wg=types.SimpleNamespace(rlk_score_sequences=score),
++        llm_server_manager=types.SimpleNamespace(server_handles=servers),
++    )
++    if corrupt_dp:
++        with pytest.raises(RuntimeError, match="raw logprob mismatch"):
++            audit.audit_version(trainer)
++        assert not (tmp_path / "initial-v0.json").exists()
++        assert list((tmp_path / "replica-0").glob("audit-v0-*.pt"))
++    else:
++        result = audit.audit_version(trainer)
++        assert [s.requests for s in servers] == [3, 3]
++        assert {r["replica_rank"] for r in result["replicas"]} == {0, 1}
++        for i in range(2):
++            record = json.loads((tmp_path / f"replica-{i}/initial-v0.json").read_text())
++            assert record["actor_dp_size"] == 2
++            raw = torch.load(tmp_path / f"replica-{i}" / record["rows"][0]["evidence_file"], weights_only=True)
++            assert raw["actor_dp_ranks"] == [0, 1] and raw["replica_rank"] == i
+diff --git a/tests/experimental/rl_kernel/test_multinode_contract_on_cpu.py b/tests/experimental/rl_kernel/test_multinode_contract_on_cpu.py
+index 102b7f95f48c0ba08523e2a44cfaa36c6d624ce5..3ea0f0f0706addfff6ee37243d97a9a30bded4e1 100644
+--- a/tests/experimental/rl_kernel/test_multinode_contract_on_cpu.py
++++ b/tests/experimental/rl_kernel/test_multinode_contract_on_cpu.py
+@@ -152,11 +152,11 @@ def test_pinned_pool_rolls_back_on_reservation_failure(monkeypatch):
+     assert all(s[1]["strategy"] == "STRICT_PACK" for s in specs)
+ 
+ 
+-def test_full_trainer_contract_keeps_numerical_gates():
++def test_full_trainer_contract_keeps_numerical_gates(tmp_path):
+     from omegaconf import OmegaConf
+ 
+     config = OmegaConf.load(ROOT / "config/dsv4_grpo.yaml")
+-    config.rlk.sync_dir = "/shared/job/policy-sync"
++    config.rlk.sync_dir = str(tmp_path / "policy-sync")
+     contract.validate_trainer_config(config)
+     config.rlk.multinode = True
+     config.rlk.actor_node_ips = ["10.0.0.1", "10.0.0.2"]
+diff --git a/verl/experimental/rl_kernel/acceptance.py b/verl/experimental/rl_kernel/acceptance.py
+index 57b1d899476a502975c9eaf4e4c8f9fb47bad4af..c661b87b3af9356167ce563f3119b3fe227fd502 100644
+--- a/verl/experimental/rl_kernel/acceptance.py
++++ b/verl/experimental/rl_kernel/acceptance.py
+@@ -9,14 +9,57 @@ from uuid import uuid4
+ 
+ import torch
+ 
+-from .cluster_contract import worker_key
+-from .trainer_contract import strict_response_parity
++from .cluster_contract import topology, worker_key
++from .trainer_contract import replica_stages, select_actor_scores, strict_response_parity, validate_actor_exports
+ 
+ 
+ def audit_version(trainer):
++    servers = trainer.llm_server_manager.server_handles
++    results = [_audit_replica(trainer, rank, server) for rank, server in enumerate(servers)]
++    if len(results) == 1:
++        return results[0]
++    version = trainer.checkpoint_manager.version
++    summary = dict(
++        weight_version=version,
++        global_steps=trainer.global_steps,
++        expected_tokens=sum(r["expected_tokens"] for r in results),
++        compared_tokens=sum(r["compared_tokens"] for r in results),
++        mismatch_count=0,
++        mean_abs_diff=0.0,
++        max_abs_diff=0.0,
++        finite=True,
++        batch_invariance=True,
++        independent_audit_seconds=sum(r["independent_audit_seconds"] for r in results),
++        replicas=[
++            dict(
++                replica_rank=i,
++                evidence_dir=f"replica-{i}",
++                expected_tokens=r["expected_tokens"],
++                compared_tokens=r["compared_tokens"],
++            )
++            for i, r in enumerate(results)
++        ],
++    )
+     root = Path(trainer.config.rlk.sync_dir)
++    name = "initial-v0.json" if version == 0 else f"post-update-v{version}.json"
++    (root / name).write_text(json.dumps(summary, indent=2))
++    with (root / "parity.jsonl").open("a") as stream:
++        stream.write(json.dumps(summary) + "\n")
++    return summary
++
++
++def _audit_root(trainer, replica_rank):
++    root = Path(trainer.config.rlk.sync_dir)
++    if len(trainer.llm_server_manager.server_handles) > 1:
++        root /= f"replica-{replica_rank}"
++    root.mkdir(parents=True, exist_ok=True)
++    return root
++
++
++def _audit_replica(trainer, replica_rank, server):
++    root = _audit_root(trainer, replica_rank)
+     version = trainer.checkpoint_manager.version
+-    server = trainer.llm_server_manager.server_handles[0]
++    dp_size = topology(trainer.config)["actor_dp_size"]
+     started = time.perf_counter()
+     prompts = [trainer.tokenizer.encode(p, add_special_tokens=True) for p in trainer.config.rlk.audit_prompts]
+     if len(prompts) != 3 or len({len(p) for p in prompts}) != 3:
+@@ -52,8 +95,11 @@ def audit_version(trainer):
+ 
+         replay = os.environ.get("RLK_REPLAY_FIXED_CASES")
+         trainer._rlk_fixed_cases = json.loads(Path(replay).read_text()) if replay else fresh
++        if not hasattr(trainer, "_rlk_fixed_cases_by_replica"):
++            trainer._rlk_fixed_cases_by_replica = {}
++        trainer._rlk_fixed_cases_by_replica[replica_rank] = trainer._rlk_fixed_cases
+         (root / "fixed-sequences.json").write_text(json.dumps(trainer._rlk_fixed_cases, indent=2))
+-    groups = [("fixed", trainer._rlk_fixed_cases), ("fresh", fresh)]
++    groups = [("fixed", trainer._rlk_fixed_cases_by_replica[replica_rank]), ("fresh", fresh)]
+     result = dict(
+         weight_version=version,
+         global_steps=trainer.global_steps,
+@@ -62,6 +108,8 @@ def audit_version(trainer):
+         mismatch_count=0,
+         rows=[],
+         fresh_sequences=fresh,
++        replica_rank=replica_rank,
++        actor_dp_size=dp_size,
+     )
+ 
+     def observe(label, left, right, extra):
+@@ -70,9 +118,11 @@ def audit_version(trainer):
+         filename = f"audit-v{version}-{label}.pt"
+         torch.save(raw, root / filename)
+         try:
++            for scores in extra["actor_dp_scores"]:
++                strict_response_parity(scores, left, torch.ones_like(left, dtype=torch.bool))
+             record = strict_response_parity(left, right, torch.ones_like(left, dtype=torch.bool))
+         except Exception as error:
+-            capture_failed_audit(trainer, label, extra["case"], selected, error)
++            capture_failed_audit(trainer, label, extra["case"], selected, error, replica_rank)
+             raise
+         record.update(label=label, evidence_file=filename)
+         result["rows"].append(record)
+@@ -82,10 +132,10 @@ def audit_version(trainer):
+ 
+     def actor_score(cases, micro):
+         replies = trainer.actor_rollout_wg.rlk_score_sequences(cases, version, micro)
+-        replies = [r for r in replies if r is not None]
+-        if len(replies) != 1 or replies[0]["weight_version"] != version:
+-            raise RuntimeError("audit requires one current final actor stage output")
+-        return replies[0]
++        replies = select_actor_scores(replies, dp_size, version)
++        if any(len(reply["scores"]) != len(cases) for reply in replies):
++            raise RuntimeError("actor DP audit omitted a requested case")
++        return replies
+ 
+     # B1 A/B/C, each repeated, real B2 AB/BA/AC/CA, each repeated.
+     orders = [
+@@ -110,7 +160,8 @@ def audit_version(trainer):
+         for ordinal, order in enumerate(orders):
+             selected = [by_id[n] for n in order]
+             label = f"{group}-{ordinal:02d}-" + "".join(order)
+-            actor_reply = actor_score(selected, len(selected))
++            actor_replies = actor_score(selected, len(selected))
++            actor_reply = actor_replies[0]
+             actor = actor_reply["scores"]
+             rollout = __import__("ray").get(server.rlk_score_sequences.remote(selected, f"v{version}-{label}"))
+             if rollout["global_steps"] != trainer.global_steps:
+@@ -123,6 +174,10 @@ def audit_version(trainer):
+                     stages=rollout["stages"],
+                     actual_actor_micro_batch_size=len(selected),
+                     actor_forward_batches=actor_reply["forward_batches"],
++                    replica_rank=replica_rank,
++                    actor_dp_ranks=[r.get("dp_rank", 0) for r in actor_replies],
++                    actor_dp_scores=[r["scores"][i].detach().cpu() for r in actor_replies],
++                    actor_dp_forward_batches=[r["forward_batches"] for r in actor_replies],
+                 )
+                 observe(label + "-" + name, left, right, extra)
+                 if name not in baseline:
+@@ -160,17 +215,17 @@ def audit_version(trainer):
+     return result
+ 
+ 
+-def capture_failed_audit(trainer, label, case, selected, error):
++def capture_failed_audit(trainer, label, case, selected, error, replica_rank=0):
+     """Observe the same live policy after failure; never turn the failed run into PASS."""
+     import ray
+ 
+-    root = Path(trainer.config.rlk.sync_dir)
++    root = _audit_root(trainer, replica_rank)
+     version = trainer.checkpoint_manager.version
+-    server = trainer.llm_server_manager.server_handles[0]
++    server = trainer.llm_server_manager.server_handles[replica_rank]
+     failure = dict(label=label, error=repr(error), weight_version=version)
+     try:
+         for suffix, cases in (("single", [case]), ("batch", selected)):
+-            trace_label = f"failure-v{version}-{label}-{suffix}"
++            trace_label = f"failure-v{version}-r{replica_rank}-{label}-{suffix}"
+             actors = trainer.actor_rollout_wg.rlk_score_sequences(cases, version, len(cases), trace_label)
+             rollout = ray.get(server.rlk_score_sequences.remote(cases, trace_label))
+             torch.save(dict(actor=actors, rollout=rollout, cases=cases), root / f"{trace_label}.pt")
+@@ -182,6 +237,18 @@ def capture_failed_audit(trainer, label, case, selected, error):
+ 
+ 
+ def stress_current_version(trainer, repeats):
++    results = [
++        _stress_replica(trainer, repeats, i, server)
++        for i, server in enumerate(trainer.llm_server_manager.server_handles)
++    ]
++    if len(results) == 1:
++        return results[0]
++    summary = dict(status="PASS", weight_version=3, replicas=results)
++    (Path(trainer.config.rlk.sync_dir) / "stress-v3.json").write_text(json.dumps(summary, indent=2))
++    return summary
++
++
++def _stress_replica(trainer, repeats, replica_rank, server):
+     """Additional real B1/B2 requests against the already audited current actor bytes.
+ 
+     No optimizer update or model reload occurs here. These are extra replay
+@@ -191,15 +258,15 @@ def stress_current_version(trainer, repeats):
+ 
+     if not isinstance(repeats, int) or repeats <= 0:
+         raise ValueError("stress repeats must be positive")
+-    root = Path(trainer.config.rlk.sync_dir)
++    root = _audit_root(trainer, replica_rank)
++    shared = Path(trainer.config.rlk.sync_dir)
+     version = trainer.checkpoint_manager.version
+     if version != 3 or trainer.global_steps != 3:
+         raise ValueError("this bounded stress probe runs after the third real update")
+-    server = trainer.llm_server_manager.server_handles[0]
+     audit = json.loads((root / "post-update-v3.json").read_text())
+-    sync = json.loads((root / "sync-v3.json").read_text())
+-    pids = {a["pipeline_stage"]: worker_key(a) for a in sync["stages"]}
+-    groups = dict(fixed=trainer._rlk_fixed_cases, fresh=audit["fresh_sequences"])
++    sync = json.loads((shared / "sync-v3.json").read_text())
++    pids = {a["pipeline_stage"]: worker_key(a) for a in replica_stages(sync, replica_rank)}
++    groups = dict(fixed=trainer._rlk_fixed_cases_by_replica[replica_rank], fresh=audit["fresh_sequences"])
+     baselines = {}
+     for group, cases in groups.items():
+         for i, case in enumerate(cases):
+@@ -253,7 +320,7 @@ def stress_current_version(trainer, repeats):
+                 try:
+                     row = strict_response_parity(actor, rollout, torch.ones_like(actor))
+                 except Exception as error:
+-                    capture_failed_audit(trainer, label, case, selected, error)
++                    capture_failed_audit(trainer, label, case, selected, error, replica_rank)
+                     raise
+                 if row["expected_tokens"] != len(case["response_ids"]):
+                     raise RuntimeError("stress comparison omitted response tokens")
+@@ -265,11 +332,12 @@ def stress_current_version(trainer, repeats):
+             if iteration % 50 == 0:
+                 print("RLK_LIVE_V3_STRESS", iteration, repeats, count, flush=True)
+     # Re-export/read back actual state, not just a version number, after stress.
+-    expected = json.loads((root / "sync-v3-raw.json").read_text())["manifest"]
++    expected = json.loads((shared / "sync-v3-raw.json").read_text())["manifest"]
+     path = root / "policy-v3-stress-readback.pt"
+     exports = trainer.actor_rollout_wg.rlk_export_policy(str(path))
+     (root / "stress-v3-actor-readback.json").write_text(json.dumps(exports, indent=2))
+-    if len(exports) != 2 or any(e["weight_version"] != 3 or e["manifest"] != expected for e in exports):
++    export = validate_actor_exports(exports, topology(trainer.config)["actor_world_size"], 3)
++    if export["manifest"] != expected:
+         raise RuntimeError("actual actor parameters changed during inference stress")
+     readbacks = ray.get(server.rlk_verify_current_policy.remote(str(path)))
+     (root / "stress-v3-rollout-readback.json").write_text(json.dumps(readbacks, indent=2))
+@@ -292,6 +360,7 @@ def stress_current_version(trainer, repeats):
+     path.unlink()
+     summary = dict(
+         status="PASS",
++        replica_rank=replica_rank,
+         weight_version=3,
+         repeats=repeats,
+         completed_repeats=repeats,
+diff --git a/verl/experimental/rl_kernel/cluster.py b/verl/experimental/rl_kernel/cluster.py
+index 89c482639729c3e5aa6d7bf028bdc7027ad50076..1795d6214141f27fac9dca76d17e627ff885d67e 100644
+--- a/verl/experimental/rl_kernel/cluster.py
++++ b/verl/experimental/rl_kernel/cluster.py
+@@ -136,9 +136,25 @@ def actor_pool_manager(manager, node_ips, gpus_per_node):
+ 
+ def record_placement(config, actors, rollout):
+     """Check actual GPU ownership before any optimizer update or policy publication."""
+-    if not config.rlk.get("multinode", False):
++    plan = topology(config)
++    if not plan["enabled"] and plan["actor_world_size"] == 2:
+         return
+     root = Path(config.rlk.sync_dir)
++    if not plan["enabled"]:
++        import os
++
++        used = {r["node_id"] for r in actors + rollout}
++        nodes = {n["NodeID"]: n["NodeManagerAddress"] for n in ray.nodes() if n["Alive"] and n["NodeID"] in used}
++        result = verify_placement(plan, actors, rollout, nodes)
++        allocation = os.environ.get("RLK_DEVICE_ALLOCATION")
++        if allocation:
++            declared = json.loads(Path(allocation).read_text())
++            for role in ("actor", "rollout"):
++                expected = {r["pci_bus_id"].lower() for r in declared if r["role"] == role}
++                if {r["pci_bus_id"].lower() for r in result[role]} != expected:
++                    raise RuntimeError(f"{role}: actual physical GPUs differ from launcher allocation")
++        (root / "single-node-placement.json").write_text(json.dumps(dict(plan=plan, nodes=nodes, **result), indent=2))
++        return
+     pre = json.loads((root / "cluster-preflight.json").read_text())
+     result = verify_placement(pre["plan"], actors, rollout, pre["nodes"])
+     (root / "cluster-placement.json").write_text(json.dumps(result, indent=2))
+diff --git a/verl/experimental/rl_kernel/cluster_contract.py b/verl/experimental/rl_kernel/cluster_contract.py
+index 966c9dbb319c2df9cc6bd8f64cc27b1ec04b970b..c7676230de86e318a359c8642daee3a94c9398a3 100644
+--- a/verl/experimental/rl_kernel/cluster_contract.py
++++ b/verl/experimental/rl_kernel/cluster_contract.py
+@@ -14,10 +14,12 @@ def topology(config):
+     enabled = rlk.get("multinode", False)
+     actor_ips = list(rlk.get("actor_node_ips", []))
+     rollout_ips = list(rollout.get("rlk_node_ips", []))
++    eight_gpu = not enabled and all(s["nnodes"] == 1 and s["n_gpus_per_node"] == 4 for s in (trainer, rollout))
+     for role, settings, ips in [("actor", trainer, actor_ips), ("rollout", rollout, rollout_ips)]:
+         nodes, gpus = settings["nnodes"], settings["n_gpus_per_node"]
+-        if type(nodes) is not int or type(gpus) is not int or (nodes, gpus) not in [(1, 2), (2, 1)]:
+-            raise ValueError(f"{role}: only PP2/DP1 on 1x2 or 2x1 GPUs is implemented")
++        layouts = [(1, 4)] if eight_gpu else [(1, 2), (2, 1)]
++        if type(nodes) is not int or type(gpus) is not int or (nodes, gpus) not in layouts:
++            raise ValueError(f"{role}: requires PP2/DP1 on 1x2 or 2x1, or single-node actor4/rollout4")
+         if enabled:
+             if len(ips) != nodes or len(set(ips)) != nodes:
+                 raise ValueError(f"{role}: supply one unique Ray node IP per node")
+@@ -33,6 +35,9 @@ def topology(config):
+         rollout_node_ips=rollout_ips,
+         actor_gpus_per_node=trainer["n_gpus_per_node"],
+         rollout_gpus_per_node=rollout["n_gpus_per_node"],
++        actor_world_size=4 if eight_gpu else 2,
++        actor_dp_size=2 if eight_gpu else 1,
++        rollout_replicas=2 if eight_gpu else 1,
+     )
+ 
+ 
+@@ -61,7 +66,14 @@ def verify_placement(plan, actor_records, rollout_records, nodes):
+     all_devices = set()
+     actual = {}
+     for role, records in [("actor", actor_records), ("rollout", rollout_records)]:
+-        if len(records) != 2 or {r["rank"] for r in records} != {0, 1}:
++        count = plan.get("actor_world_size", 2) if role == "actor" else 2 * plan.get("rollout_replicas", 1)
++        ranks = (
++            {(r.get("replica_rank", 0), r["rank"]) for r in records}
++            if role == "rollout"
++            else {r["rank"] for r in records}
++        )
++        expected_ranks = {(i, p) for i in range(count // 2) for p in (0, 1)} if role == "rollout" else set(range(count))
++        if len(records) != count or ranks != expected_ranks:
+             raise RuntimeError(f"{role}: missing or duplicate PP rank")
+         counts = {}
+         for record in records:
+@@ -75,6 +87,10 @@ def verify_placement(plan, actor_records, rollout_records, nodes):
+                 raise RuntimeError("actor/rollout physical GPU assignment overlaps")
+             all_devices.add(device)
+         expected = {ip: plan[f"{role}_gpus_per_node"] for ip in plan[f"{role}_node_ips"]}
++        if not plan["enabled"]:
++            if len(nodes) != 1:
++                raise RuntimeError("single-node placement requires exactly one physical node")
++            expected = {next(iter(nodes.values())): count}
+         if counts != expected:
+             raise RuntimeError(f"{role}: observed placement {counts} differs from {expected}")
+         actual[role] = records
+diff --git a/verl/experimental/rl_kernel/config/recipe/dsv4_grpo_8gpu.yaml b/verl/experimental/rl_kernel/config/recipe/dsv4_grpo_8gpu.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..39484bf500b5cc3534ceb736275247f6208f6718
+--- /dev/null
++++ b/verl/experimental/rl_kernel/config/recipe/dsv4_grpo_8gpu.yaml
+@@ -0,0 +1,31 @@
++# @package _global_
++# SPDX-License-Identifier: Apache-2.0
++# Applied to dsv4_grpo with +recipe=dsv4_grpo_8gpu.
++# One node: actor PP2 x DP2, plus two independent PP2 rollout replicas.
++trainer:
++  n_gpus_per_node: 4
++  total_training_steps: 3
++
++data:
++  train_batch_size: 2
++  max_prompt_length: 128
++  max_response_length: 16
++  dataloader_num_workers: 0
++  shuffle: false
++
++actor_rollout_ref:
++  actor:
++    ppo_mini_batch_size: 2
++  rollout:
++    n_gpus_per_node: 4
++    n: 2
++    seed: 42
++    max_model_len: 256
++    max_num_batched_tokens: 512
++    max_num_seqs: 8
++    enable_chunked_prefill: false
++    agent:
++      num_workers: 1
++
++rlk:
++  audit_response_length: 16
+diff --git a/verl/experimental/rl_kernel/trainer.py b/verl/experimental/rl_kernel/trainer.py
+index 45154fa05cc1b830de9b7b9525c4ca9944110921..9eace4cb8d946bf6c1dbfc06596ef4e3b23ea7db 100644
+--- a/verl/experimental/rl_kernel/trainer.py
++++ b/verl/experimental/rl_kernel/trainer.py
+@@ -35,6 +35,7 @@ from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync
+ from verl.workers.engine_workers import ActorRolloutRefWorker
+ 
+ from .trainer_contract import strict_response_parity, validate_trainer_config
++from .cluster_contract import topology
+ from .trainer_rollout import RLKTrainerReplica
+ from .trainer_sync import RLKPolicySync
+ 
+@@ -86,7 +87,15 @@ class RLKActorWorker(ActorRolloutRefWorker):
+             manifest[name] = dict(shape=list(cpu.shape), dtype=str(cpu.dtype), sha256=digest(cpu))
+             if dist.get_rank() == 0:
+                 weights[name] = cpu
+-        payload = dict(weight_version=engine.rlk_weight_version, manifest=manifest)
++        from megatron.core import parallel_state
++
++        payload = dict(
++            weight_version=engine.rlk_weight_version,
++            manifest=manifest,
++            rank=dist.get_rank(),
++            dp_rank=engine.get_data_parallel_rank(),
++            pipeline_stage=parallel_state.get_pipeline_model_parallel_rank(),
++        )
+         if dist.get_rank() == 0:
+             destination = Path(path)
+             pending = destination.with_suffix(".pending")
+@@ -170,11 +179,17 @@ class RLKActorWorker(ActorRolloutRefWorker):
+             row[len(case["prompt_ids"]) - 1 : len(case["prompt_ids"]) + len(case["response_ids"]) - 1]
+             for row, case in zip(output["log_probs"].unbind(), cases, strict=True)
+         ]
+-        return dict(weight_version=weight_version, scores=scores, forward_batches=observed)
++        return dict(
++            weight_version=weight_version,
++            scores=scores,
++            forward_batches=observed,
++            rank=dist.get_rank(),
++            dp_rank=engine.get_data_parallel_rank(),
++        )
+ 
+ 
+ class RLKVerlTrainer(PPOTrainerSync):
+-    """A narrow PP2/DP1 GRPO recipe using the ordinary upstream fit loop."""
++    """PP2 GRPO with one or two DP replicas using the upstream fit loop."""
+ 
+     _enable_hybrid_replicas = False
+ 
+@@ -210,9 +225,20 @@ class RLKVerlTrainer(PPOTrainerSync):
+         record_placement(
+             self.config,
+             self.actor_rollout_wg.rlk_placement(),
+-            ray.get(manager.server_handles[0].rlk_placement.remote()),
++            [
++                record
++                for group in ray.get([server.rlk_placement.remote() for server in manager.server_handles])
++                for record in group
++            ],
++        )
++        plan = topology(self.config)
++        self.checkpoint_manager = RLKPolicySync(
++            self.actor_rollout_wg,
++            manager.server_handles,
++            self.config.rlk.sync_dir,
++            actor_world_size=plan["actor_world_size"],
++            rollout_replicas=plan["rollout_replicas"],
+         )
+-        self.checkpoint_manager = RLKPolicySync(self.actor_rollout_wg, manager.server_handles, self.config.rlk.sync_dir)
+ 
+     def _compute_old_log_prob(self, batch, metrics):
+         import transfer_queue as tq
+@@ -340,8 +366,13 @@ class RLKVerlTrainer(PPOTrainerSync):
+                     global_steps=global_steps,
+                     metrics=metrics,
+                     timing_seconds=timing_raw,
+-                    rollout_gpus=2,
+-                    total_job_gpus=4,
++                    rollout_gpus=self.config.actor_rollout_ref.rollout.nnodes
++                    * self.config.actor_rollout_ref.rollout.n_gpus_per_node,
++                    total_job_gpus=(
++                        self.config.trainer.nnodes * self.config.trainer.n_gpus_per_node
++                        + self.config.actor_rollout_ref.rollout.nnodes
++                        * self.config.actor_rollout_ref.rollout.n_gpus_per_node
++                    ),
+                     includes_audit=True,
+                 ),
+                 indent=2,
+diff --git a/verl/experimental/rl_kernel/trainer_contract.py b/verl/experimental/rl_kernel/trainer_contract.py
+index 0fff7bf5c1b61b6e9543f4f8e97ff4765cc79008..a66dcf0a2dea9af13aa18f85d93ecc69e0ef6b1d 100644
+--- a/verl/experimental/rl_kernel/trainer_contract.py
++++ b/verl/experimental/rl_kernel/trainer_contract.py
+@@ -35,7 +35,7 @@ def value(config, path, default=None):
+ 
+ def validate_trainer_config(config):
+     """Fail before allocating Ray resources for unimplemented combinations."""
+-    topology(config)
++    plan = topology(config)
+     required = {
+         "trainer.use_v1": True,
+         "trainer.v1.trainer_mode": "sync",
+@@ -94,6 +94,10 @@ def validate_trainer_config(config):
+         errors.append("GRPO requires rollout.n >= 2")
+     if value(config, "actor_rollout_ref.actor.ppo_mini_batch_size") != value(config, "data.train_batch_size"):
+         errors.append("ppo_mini_batch_size must equal train_batch_size (both count prompts)")
++    prompts = value(config, "data.train_batch_size", 0)
++    responses = value(config, "actor_rollout_ref.rollout.n", 0)
++    if prompts * responses % plan["actor_dp_size"]:
++        errors.append("training responses must divide evenly across actor DP replicas")
+     if value(config, "trainer.v1.sync.parameter_sync_step", 1) != 1:
+         errors.append("this acceptance recipe requires parameter_sync_step=1")
+     sync_dir = value(config, "rlk.sync_dir")
+@@ -125,6 +129,47 @@ def logical_cases(input_ids):
+     return list(cases.values())
+ 
+ 
++def validate_actor_exports(exports, world_size, version=None):
++    """Require every actor rank to export the same complete policy version."""
++    if len(exports) != world_size or not exports:
++        raise RuntimeError("expected every actor PP/DP rank to export")
++    first = exports[0]
++    if any(e["manifest"] != first["manifest"] or e["weight_version"] != first["weight_version"] for e in exports):
++        raise RuntimeError("actor PP/DP ranks disagree on exported state or version")
++    if version is not None and first["weight_version"] != version:
++        raise RuntimeError("actor exported a stale weight version")
++    if world_size > 2 or any("rank" in e for e in exports):
++        if {e["rank"] for e in exports} != set(range(world_size)):
++            raise RuntimeError("missing or duplicate actor export rank")
++        if {(e["dp_rank"], e["pipeline_stage"]) for e in exports} != {
++            (d, p) for d in range(world_size // 2) for p in (0, 1)
++        }:
++            raise RuntimeError("missing or duplicate actor PP/DP coordinate")
++    return first
++
++
++def select_actor_scores(replies, dp_size, version):
++    """Keep one independently observed last-stage output for every DP replica."""
++    replies = [r for r in replies if r is not None]
++    if len(replies) != dp_size or any(r["weight_version"] != version for r in replies):
++        raise RuntimeError("audit requires one current final actor stage output per DP replica")
++    if {r.get("dp_rank", 0) for r in replies} != set(range(dp_size)):
++        raise RuntimeError("missing or duplicate actor audit DP rank")
++    return sorted(replies, key=lambda r: r.get("dp_rank", 0))
++
++
++def replica_stages(record, replica_rank=0):
++    """Read both historical single-replica and current multi-replica evidence."""
++    if "replicas" not in record:
++        if replica_rank != 0:
++            raise RuntimeError("missing rollout replica evidence")
++        return record["stages"]
++    matches = [r for r in record["replicas"] if r["replica_rank"] == replica_rank]
++    if len(matches) != 1:
++        raise RuntimeError("missing or duplicate rollout replica evidence")
++    return matches[0]["stages"]
++
++
+ def validate_stage_acks(acks, manifest, version, previous_pids=None):
+     """Every original tensor must be read back once on the two live stages."""
+     if len(acks) != 2 or {ack["pipeline_stage"] for ack in acks} != {0, 1}:
+diff --git a/verl/experimental/rl_kernel/trainer_engine.py b/verl/experimental/rl_kernel/trainer_engine.py
+index ed51c86bf67b5b941e7426791bbb0e8a6f1c2b97..de179f7db2e068ccc1ae0a60be7a50e73cef04bc 100644
+--- a/verl/experimental/rl_kernel/trainer_engine.py
++++ b/verl/experimental/rl_kernel/trainer_engine.py
+@@ -62,9 +62,7 @@ def bind_actor_operators(model):
+         bind_native_inverse_rope(attention)
+         if getattr(attention.core_attention, "compressor", None) is not None:
+             bind_compressor_projection(attention.core_attention.compressor)
+-            bind_native_compressor(
+-                attention.core_attention.compressor, attention._rlk_qkv_preprocess
+-            )
++            bind_native_compressor(attention.core_attention.compressor, attention._rlk_qkv_preprocess)
+         if getattr(attention.core_attention, "indexer", None) is not None:
+             bind_compressor_projection(attention.core_attention.indexer.compressor)
+     for layer in model.decoder.layers[1::2]:
+@@ -100,7 +98,9 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
+             bind_actor_operators(model)
+         from examples.operators.dsv4_4l.distributed_evidence import PipelineBoundaryEvidence
+ 
+-        self._rlk_boundary = PipelineBoundaryEvidence(self._rlk_models[0], dp_rank=0)
++        from megatron.core import parallel_state
++
++        self._rlk_boundary = PipelineBoundaryEvidence(self._rlk_models[0], dp_rank=self.get_data_parallel_rank())
+         self._rlk_previous_optimizer = None
+         if self.engine_config.rlk_evidence_dir:
+             import os
+@@ -114,12 +114,12 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
+                 json.dumps(
+                     dict(
+                         rank=dist.get_rank(),
++                        dp_rank=self.get_data_parallel_rank(),
++                        pipeline_stage=parallel_state.get_pipeline_model_parallel_rank(),
+                         actual_model_class=type(self._rlk_models[0]).__module__
+                         + "."
+                         + type(self._rlk_models[0]).__qualname__,
+-                        actual_model_source=__import__("inspect").getfile(
+-                            type(self._rlk_models[0])
+-                        ),
++                        actual_model_source=__import__("inspect").getfile(type(self._rlk_models[0])),
+                         trainable_inventory={
+                             name: dict(shape=list(p.shape), dtype=str(p.dtype), elements=p.numel())
+                             for name, p in self._rlk_models[0].named_parameters()
+@@ -130,9 +130,7 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
+                             "verl.experimental.rl_kernel.runtime", fromlist=["process_identity"]
+                         ).process_identity("actor"),
+                         device_identity=hip_device_identity(),
+-                        original_layer_ids=list(
+-                            self._rlk_models[0]._rlk_checkpoint_stage.layer_ids
+-                        ),
++                        original_layer_ids=list(self._rlk_models[0]._rlk_checkpoint_stage.layer_ids),
+                     ),
+                     indent=2,
+                 )
+@@ -149,13 +147,9 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
+         actual_max = max(len(row) for row in batch["input_ids"].unbind())
+         tu.assign_non_tensor(
+             batch,
+-            forced_max_seqlen=max(
+-                int(forced), actual_max, int(getattr(self.tf_config, "csa_window_size", 1))
+-            ),
+-        )
+-        return super().forward_step(
+-            iter((batch,)), model, logits_processor_func, postprocess_micro_batch_func
++            forced_max_seqlen=max(int(forced), actual_max, int(getattr(self.tf_config, "csa_window_size", 1))),
+         )
++        return super().forward_step(iter((batch,)), model, logits_processor_func, postprocess_micro_batch_func)
+ 
+     def _lm_head_logits_processor(self, logits, label, temperature, **kwargs):
+         # Padded temperature entries are zero; only nonpadding entries may be 1.
+@@ -232,10 +226,19 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
+         if self.engine_config.rlk_evidence_dir:
+             (
+                 Path(self.engine_config.rlk_evidence_dir)
+-                / f"native-loss-rank{dist.get_rank()}-v{self.rlk_weight_version+1}.json"
++                / f"native-loss-rank{dist.get_rank()}-v{self.rlk_weight_version + 1}.json"
+             ).write_text(json.dumps(calls, indent=2))
+         return result
+ 
++    def train_batch(self, data, loss_function):
++        if self.get_data_parallel_size() == 1:
++            return super().train_batch(data, loss_function)
++        from examples.operators.dsv4_4l.distributed_evidence import ddp_step_evidence
++
++        with ddp_step_evidence(self, self._rlk_models[0]) as evidence:
++            self._rlk_ddp_evidence = evidence
++            return super().train_batch(data, loss_function)
++
+     def optimizer_step(self):
+         import torch.distributed as dist
+         from rl_engine.integrations.engines.rollout.vllm.checkpoint_sync import digest
+@@ -264,18 +267,14 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
+                 gradients.append(gradient)
+                 gradient_records[name] = tensor_record(gradient)
+         finite = all(bool(torch.isfinite(gradient).all()) for gradient in gradients)
+-        finite = finite and all(
+-            row["finite"] for rows in self._rlk_autograd_receipts.values() for row in rows
+-        )
++        finite = finite and all(row["finite"] for rows in self._rlk_autograd_receipts.values() for row in rows)
+         missing_effective = [
+             name
+             for name, record in gradient_records.items()
+             if record["nonzero"] and not self._rlk_autograd_receipts.get(name)
+         ]
+         if missing_effective:
+-            raise RuntimeError(
+-                f"effective optimizer gradients lack actual autograd receipt: {missing_effective}"
+-            )
++            raise RuntimeError(f"effective optimizer gradients lack actual autograd receipt: {missing_effective}")
+         if not finite:
+             raise RuntimeError("nonfinite actor gradients before the native optimizer step")
+         nonzero = any(bool(torch.count_nonzero(gradient)) for gradient in gradients)
+@@ -290,13 +289,9 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
+             previous=self._rlk_previous_optimizer,
+         )
+         self._rlk_previous_optimizer = optimizer_after
+-        changed = [
+-            name for name, parameter in parameters.items() if digest(parameter) != before[name]
+-        ]
++        changed = [name for name, parameter in parameters.items() if digest(parameter) != before[name]]
+         if not changed:
+-            raise RuntimeError(
+-                "native optimizer did not change any trainable parameter on this PP stage"
+-            )
++            raise RuntimeError("native optimizer did not change any trainable parameter on this PP stage")
+         if self.engine_config.rlk_evidence_dir:
+             root = Path(self.engine_config.rlk_evidence_dir)
+             root.mkdir(parents=True, exist_ok=True)
+@@ -305,6 +300,9 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
+                     dict(
+                         weight_version=self.rlk_weight_version,
+                         rank=dist.get_rank(),
++                        dp_rank=self.get_data_parallel_rank(),
++                        pipeline_stage=int(not self._rlk_models[0].pre_process),
++                        ddp_evidence=getattr(self, "_rlk_ddp_evidence", None),
+                         optimizer_before=optimizer_before,
+                         optimizer_after=optimizer_after,
+                         optimizer_continuity=True,
+diff --git a/verl/experimental/rl_kernel/trainer_rollout.py b/verl/experimental/rl_kernel/trainer_rollout.py
+index a38c31a101e1ff4eddf933af1976852bb66072ea..e1f8067dfdba49e2f15c28c457451843f30de9b0 100644
+--- a/verl/experimental/rl_kernel/trainer_rollout.py
++++ b/verl/experimental/rl_kernel/trainer_rollout.py
+@@ -14,6 +14,7 @@
+ """Standalone replica extension used by verl's normal LLMServerManager."""
+ 
+ import os
++from pathlib import Path
+ 
+ import ray
+ from rl_engine.integrations.orchestrators.verl.pipeline_rollout import RLKPipelineVLLMHttpServer
+@@ -33,7 +34,10 @@ class RLKTrainerVLLMServer(RLKPipelineVLLMHttpServer):
+         # Match native MCore's original checkpoint ownership (layers 0-2 / 3).
+         # These settings affect this dedicated server and its mp children only.
+         os.environ["RLK_NODE_ID"] = ray.get_runtime_context().get_node_id()
+-        os.environ["RLK_SYNC_DIR"] = str(kwargs["config"].rlk_sync_dir or "/outputs/policy-sync")
++        sync_dir = Path(kwargs["config"].rlk_sync_dir or "/outputs/policy-sync")
++        if kwargs["config"].nnodes * kwargs["config"].n_gpus_per_node == 4:
++            sync_dir /= f"replica-{kwargs['replica_rank']}"
++        os.environ["RLK_SYNC_DIR"] = str(sync_dir)
+         os.environ.update(
+             VLLM_PP_LAYER_PARTITION="3,1",
+             VLLM_ROCM_USE_AITER="1",
+@@ -53,7 +57,8 @@ class RLKTrainerVLLMServer(RLKPipelineVLLMHttpServer):
+         engine_kwargs.pop("rlk_mhc_backend", None)
+ 
+     async def rlk_placement(self):
+-        return await self.collective_rpc("rlk_placement")
++        records = await self.collective_rpc("rlk_placement")
++        return [dict(record, replica_rank=self.replica_rank) for record in records]
+ 
+     async def rlk_load_policy(self, path, global_steps):
+         if not self._submission_paused:
+diff --git a/verl/experimental/rl_kernel/trainer_sync.py b/verl/experimental/rl_kernel/trainer_sync.py
+index 2b0ea789fc47ad6711e67d68efe5f19f40c83475..50ce0fd70dc3facd27069ec2b8eb3bda9c2d1d7d 100644
+--- a/verl/experimental/rl_kernel/trainer_sync.py
++++ b/verl/experimental/rl_kernel/trainer_sync.py
+@@ -18,7 +18,7 @@ import json
+ from pathlib import Path
+ from uuid import uuid4
+ 
+-from .trainer_contract import validate_stage_acks
++from .trainer_contract import validate_actor_exports, validate_stage_acks
+ 
+ 
+ class RLKPolicySync:
+@@ -28,12 +28,18 @@ class RLKPolicySync:
+     no best-effort fallback to stale weights or the generic PP1 IPC path.
+     """
+ 
+-    def __init__(self, actor_wg, servers, sync_dir):
++    def __init__(self, actor_wg, servers, sync_dir, *, actor_world_size=2, rollout_replicas=1):
+         self.actor_wg = actor_wg
+         self.servers = list(servers)
+         self.root = Path(sync_dir)
+-        if not self.root.is_absolute() or len(self.servers) != 1:
+-            raise ValueError("one PP2 replica and an absolute shared sync directory are required")
++        if (
++            not self.root.is_absolute()
++            or len(self.servers) != rollout_replicas
++            or (actor_world_size, rollout_replicas) not in ((2, 1), (4, 2))
++        ):
++            raise ValueError("PP2 actor/rollout layout and absolute shared sync directory are required")
++        self.actor_world_size = actor_world_size
++        self.replica_pids = {}
+         self.root.mkdir(parents=True, exist_ok=True)
+         self.version = None
+         self.pids = None
+@@ -51,28 +57,31 @@ class RLKPolicySync:
+         return asyncio.run(self.update(global_steps))
+ 
+     async def update(self, global_steps=None):
+-        await asyncio.gather(
+-            *[server.abort_all_requests.remote(reset_prefix_cache=True) for server in self.servers]
+-        )
++        await asyncio.gather(*[server.abort_all_requests.remote(reset_prefix_cache=True) for server in self.servers])
+         path = self.root / f"policy-{uuid4().hex}.pt"
+         exports = self.actor_wg.rlk_export_policy(str(path))
+-        if not exports or len(exports) != 2:
+-            raise RuntimeError("expected both actor PP stages to export")
+-        first = exports[0]
+-        if any(item != first for item in exports):
+-            raise RuntimeError("actor PP ranks disagree on exported state or version")
++        first = validate_actor_exports(exports, self.actor_world_size)
+         version, manifest = first["weight_version"], first["manifest"]
+         if version != (0 if self.version is None else self.version + 1):
+             raise RuntimeError("a trainer update did not advance the optimizer weight version")
+-        acks = await self.servers[0].rlk_load_policy.remote(str(path), global_steps)
++        replies = await asyncio.gather(
++            *[server.rlk_load_policy.remote(str(path), global_steps) for server in self.servers]
++        )
++        replicas = [dict(replica_rank=i, stages=acks) for i, acks in enumerate(replies)]
+         (self.root / f"sync-v{version}-raw.json").write_text(
+-            json.dumps(dict(manifest=manifest, stages=acks), indent=2)
++            json.dumps(dict(manifest=manifest, stages=replies[0], replicas=replicas, actor_exports=exports), indent=2)
+         )
+-        pids = validate_stage_acks(acks, manifest, version, self.pids)
+-        record = dict(global_steps=global_steps, weight_version=version, stages=acks)
++        replica_pids = {
++            i: validate_stage_acks(acks, manifest, version, self.replica_pids.get(i)) for i, acks in enumerate(replies)
++        }
++        workers = [pid for group in replica_pids.values() for pid in group.values()]
++        if len(set(workers)) != 2 * len(self.servers):
++            raise RuntimeError("rollout replicas share a worker identity")
++        record = dict(global_steps=global_steps, weight_version=version, stages=replies[0], replicas=replicas)
+         (self.root / f"sync-v{version}.json").write_text(json.dumps(record, indent=2))
+         # Publish the new version and reopen only after every stage passed.
+-        self.version, self.pids, self.manifest = version, pids, manifest
++        self.version, self.pids, self.manifest = version, replica_pids[0], manifest
++        self.replica_pids = replica_pids
+         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
+         if version:
+             # Retain real post-update values so a later numerical failure can

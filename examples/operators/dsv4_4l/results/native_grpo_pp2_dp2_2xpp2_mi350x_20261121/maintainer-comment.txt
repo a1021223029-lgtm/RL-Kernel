@@ -1,0 +1,20 @@
+Eight-GPU follow-up to RL-Align/RL-Kernel#717, with RL-Align/verl#3 as the companion integration baseline. This follow-up supplies new eight-GPU changes as complete paired patches for review against the bases in versions.json.
+
+Single-node 8x MI350X validation completed for the four-layer DeepSeek-V4 model using native verl + RL-Kernel.
+
+- Actor: 4 GPUs, PP2 x DP2. Rollout: 4 GPUs, two independent PP2 instances. TP/EP/CP = 1.
+- Completed 3 consecutive native GRPO/PPO optimizer updates. Training and the independent evidence verifier both exited 0.
+- Both rollout instances passed v0-v3 train/rollout consistency: expected = compared = 2,376 audit token observations per version; mismatch_count = mean_abs_diff = max_abs_diff = 0.
+- Verified native DP gradient reduction, optimizer continuity, pipeline transfers and complete sync-eligible policy readback on both rollout instances. Post-training 8-GPU smoke test passed.
+
+The initial GPU resets were reproduced with a single-element tensor on one GPU. KFD queue counters were UINT32_MAX, producing a 72-byte runlist allocation for an 84-byte first process packet. A four-GPU control including that GPU also failed. Rebooting the host and reloading the same driver restored the state; the original underflow trigger is still undetermined.
+
+During this agent-assisted validation, the DP2 evidence callback crashed on tensor_record(None). The agent adapted the observer to record real gradients and return the original Tensor/None, following RLKVerlMegatronEngine.forward_backward_batch.received in the pre-eight-GPU verl baseline d154f5aa3d9a5a19210bc2df499db6ef6532db90. This was an agent-authored adaptation and is submitted for maintainer review. The failing callback did not log which parameter produced None, so that parameter-specific origin remains undetermined. Required mHC backward, effective-gradient and native DDP checks remain enabled.
+
+One new real-autograd CPU regression reproduced the original AttributeError before the fix. That regression and the 9 existing CPU cases passed locally and in the final image; Ruff passed. The three-step GPU run and independent evidence verification were separate checks. Numerical tolerances were preserved.
+
+Tested source heads: RL-Kernel 6df8e1d8257859e9aae00b31d3d60b011024b954; verl 7c6dc4922c02fa8c0e1023acd26789f7de875b51. The attached bundle contains complete diffs against the recorded bases, version pins, original verifier output and rerun commands. The measured image is currently local to the validation host, not a published registry image.
+
+Scope: quantized base weights remain frozen, consistent with the previous four-GPU validation. This is a three-step correctness result; longer-run throughput and multi-node validation remain separate work.
+
+AI assistance was used for implementation and debugging. Please review the paired RL-Kernel/verl changes together.
